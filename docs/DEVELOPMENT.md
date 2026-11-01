@@ -46,4 +46,4 @@ Raise the version in `Cargo.toml`, then run:
 scripts\release\publish.ps1 -Notes "What changed"
 ```
 
-The script builds `dist\GitMap-Setup.exe` and a signed `dist\latest.json`. With `-Publish` it uploads the release to `ServChan/gitmap-releases`, which must stay public.
+The script builds `dist\GitMap-Setup.exe` and a signed `dist\latest.json`. With `-Publish` it uploads the release to `ServChan/GitMap`, which must stay public.

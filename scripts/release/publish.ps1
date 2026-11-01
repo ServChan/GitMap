@@ -10,7 +10,7 @@
 param(
     [string]$Notes = '',
     [string]$NotesFile = '',
-    [string]$Repo = 'ServChan/gitmap-releases',
+    [string]$Repo = 'ServChan/GitMap',
     [switch]$Publish
 )
 $ErrorActionPreference = 'Stop'

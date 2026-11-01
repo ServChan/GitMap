@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const MANIFEST_URL: &str = "https://github.com/ServChan/gitmap-releases/releases/latest/download/latest.json";
+const MANIFEST_URL: &str = "https://github.com/ServChan/GitMap/releases/latest/download/latest.json";
 const PUBKEY: Option<&str> = option_env!("GITMAP_UPDATER_PUBKEY");
 const TIMEOUT: Duration = Duration::from_secs(20);
 /// Как часто проверять обновления сами по себе.
