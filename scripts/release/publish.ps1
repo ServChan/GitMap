@@ -49,6 +49,9 @@ $dist = Join-Path $root 'dist'
 New-Item -ItemType Directory -Force $dist | Out-Null
 $setup = Join-Path $dist 'GitMap-Setup.exe'
 Copy-Item -Force "$root\target\release\gitmap.exe" $setup
+# Cargo может счесть старую сборку свежей, а подпись поставит версию из Cargo.toml.
+$built = (Get-Item $setup).VersionInfo.ProductVersion
+if ($built -ne $version) { throw "Собран exe версии $built, а в Cargo.toml $version. Выполните cargo clean -p gitmap --release" }
 $signer = "$root\target\release\gitmap-sign.exe"
 
 $env:GITMAP_SIGNING_KEY = Get-ReleaseSecret $UpdaterKeyTarget
