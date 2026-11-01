@@ -33,7 +33,7 @@ Windows app that draws the history of your git repositories as a living metro ma
 
 ### Установка
 
-Скачай `GitMap-Setup.exe` со страницы [выпусков](https://github.com/ServChan/gitmap-releases/releases/latest) и запусти: откроется мастер. Программа ставится для одного пользователя в `%LOCALAPPDATA%\Programs\GitMap`, права администратора не нужны. Удаляется из «Приложений» Windows или повторным запуском установщика.
+Скачай `GitMap-Setup.exe` со страницы [выпусков](https://github.com/ServChan/GitMap/releases/latest) и запусти: откроется мастер. Программа ставится для одного пользователя в `%LOCALAPPDATA%\Programs\GitMap`, права администратора не нужны. Удаляется из «Приложений» Windows или повторным запуском установщика.
 
 Раз в день программа проверяет новую версию и показывает кнопку обновления. Скачанное проверяется подписью ed25519, проверку можно выключить в окне. Настройки лежат в `%APPDATA%\GitMap\settings.json`.
 
@@ -75,7 +75,7 @@ The interface is in Russian.
 
 ### Installation
 
-Download `GitMap-Setup.exe` from the [releases page](https://github.com/ServChan/gitmap-releases/releases/latest) and run it to open the wizard. It installs for one user into `%LOCALAPPDATA%\Programs\GitMap` and needs no administrator rights. Uninstall it from Windows Apps or by running the installer again.
+Download `GitMap-Setup.exe` from the [releases page](https://github.com/ServChan/GitMap/releases/latest) and run it to open the wizard. It installs for one user into `%LOCALAPPDATA%\Programs\GitMap` and needs no administrator rights. Uninstall it from Windows Apps or by running the installer again.
 
 Once a day the app checks for a new version and shows an update button. Downloads are verified with an ed25519 signature, and the check can be turned off in the window. Settings live in `%APPDATA%\GitMap\settings.json`.
 
