@@ -450,7 +450,20 @@ impl<'a> Ui<'a> {
                 self.state.caret = self.caret_at(value, at);
                 self.state.anchor = self.state.caret;
                 self.state.caret_moved = self.now();
-                self.state.active = Some(key);
+                if self.input.double_click {
+                    let chars: Vec<char> = value.chars().collect();
+                    let (mut start, mut end) = (self.state.caret, self.state.caret);
+                    while start > 0 && chars[start - 1].is_alphanumeric() {
+                        start -= 1;
+                    }
+                    while end < chars.len() && chars[end].is_alphanumeric() {
+                        end += 1;
+                    }
+                    self.state.anchor = start;
+                    self.state.caret = end;
+                } else {
+                    self.state.active = Some(key);
+                }
             }
         }
         if self.state.active == Some(key) {

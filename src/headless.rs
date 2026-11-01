@@ -143,6 +143,26 @@ pub fn run(script: &str, args: StartArgs) -> Result<(), String> {
                 rig.input.text = parts[1..].join(" ");
                 rig.step();
             }
+            // Внешняя команда посреди сценария: например, коммит в проверяемый репозиторий.
+            "exec" => {
+                let line = parts[1..].join(" ").replace('|', ";");
+                let _ = std::process::Command::new("cmd").args(["/C", &line]).output();
+            }
+            "export" => {
+                let pal = rig.app.palette();
+                if parts[1] == "svg" {
+                    let session = rig.app.session.as_ref().ok_or("нет открытого проекта")?;
+                    std::fs::write(parts[2], crate::export::svg(session, pal)).map_err(|e| e.to_string())?;
+                } else {
+                    rig.app.map_only = true;
+                    rig.step();
+                    let (w, h) = rig.size;
+                    let mut outer = Scene::new();
+                    outer.append(&rig.scene, Some(Affine::scale(2.0)));
+                    rig.app.map_only = false;
+                    gpu.render_png(&outer, (w * 2.0) as u32, (h * 2.0) as u32, pal.ground, Path::new(parts[2]))?;
+                }
+            }
             "shot" => {
                 let base = rig.app.palette().ground;
                 let (w, h) = rig.size;

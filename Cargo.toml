@@ -1,6 +1,6 @@
 [package]
 name = "gitmap"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 description = "Карта веток git-репозиториев"
 default-run = "gitmap"
@@ -11,7 +11,7 @@ base64 = "0.23.1"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 ed25519-dalek = "3.0.0"
 getrandom = "0.4.3"
-gix = { version = "0.90.0", default-features = false, features = ["revision", "blob-diff", "parallel", "sha1"] }
+gix = { version = "0.90.0", default-features = false, features = ["revision", "blob-diff", "parallel", "sha1", "status"] }
 parley = "0.12.0"
 png = "0.18.1"
 pollster = "0.4"

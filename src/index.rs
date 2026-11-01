@@ -9,12 +9,13 @@ use crate::theme::{fade, mix};
 use crate::ui::{Tone, Ui, id};
 use crate::{fmt, install};
 use std::collections::HashMap;
-use vello::kurbo::{Line, Point, Rect, RoundedRect, Stroke};
+use vello::kurbo::{Circle, Line, Point, Rect, RoundedRect, Stroke};
 
 const ROW: f64 = 34.0;
 const GROUP: f64 = 36.0;
 
 enum Item {
+    Overview,
     Group { name: String, count: usize, open: f64 },
     Repo(usize),
 }
@@ -102,8 +103,9 @@ pub fn show(ui: &mut Ui, app: &mut App, rect: Rect) {
 
     // Сначала раскладка: блок выбора должен знать свою строку раньше, чем строки нарисованы.
     let mut items: Vec<(Item, f64, f64)> = Vec::new();
-    let mut y = 6.0;
-    let mut selected_y = None;
+    items.push((Item::Overview, 6.0, ROW));
+    let mut y = 6.0 + ROW + 2.0;
+    let mut selected_y = app.open_path.is_none().then_some(6.0);
     for (group, members) in &groups {
         let collapsed = needle.is_empty() && app.settings.collapsed.contains(group);
         let open = ui.tween(("group", group), !collapsed, anim::SOFT) as f64;
@@ -132,6 +134,7 @@ pub fn show(ui: &mut Ui, app: &mut App, rect: Rect) {
 
     let mut open_path = None;
     let mut toggle = None;
+    let mut go_overview = false;
     let now = ui.now();
     ui.scroll("projects", list, |ui, offset| {
         ui.scroll_content("projects", total);
@@ -148,6 +151,33 @@ pub fn show(ui: &mut Ui, app: &mut App, rect: Rect) {
             }
             let row = Rect::new(list.x0 + 8.0, top, list.x1 - 8.0, top + height);
             match item {
+                Item::Overview => {
+                    let key = id("overview-row");
+                    let selected = app.open_path.is_none();
+                    let response = ui.interact(key, row);
+                    if response.clicked {
+                        go_overview = true;
+                    }
+                    let hover = ui.tween((key, "hover"), response.hovered, anim::SNAP);
+                    let lit = ui.tween((key, "lit"), selected, anim::SNAP);
+                    if lit < 0.5 {
+                        ui.fill(&RoundedRect::from_rect(row.inset((0.0, -1.0)), 9.0), fade(pal.sheet_hover, hover));
+                    }
+                    let (ink, weak) = (mix(pal.ink, pal.sheet, lit), mix(pal.ink_weak, pal.sheet, lit));
+                    ui.line("Обзор папки", Face::Semi, 14.0, row.x0 + 10.0, row.center().y, row.width() - 80.0, ink);
+                    let trouble = app
+                        .repos
+                        .iter()
+                        .filter_map(|r| r.health.as_ref())
+                        .filter(|h| h.unpushed > 0 || h.dirty > 0)
+                        .count();
+                    if trouble > 0 {
+                        ui.line_right(&fmt::number(trouble), Face::Body, 12.5, row.x1 - 10.0, row.center().y, weak);
+                    }
+                    if response.focused {
+                        ui.focus_ring(row, 9.0);
+                    }
+                }
                 Item::Group { name, count, open } => {
                     let key = id(("group-row", name));
                     let response = ui.interact(key, row);
@@ -201,8 +231,15 @@ pub fn show(ui: &mut Ui, app: &mut App, rect: Rect) {
                     let y = row.center().y;
                     let age_width = ui.line_right(&age, Face::Body, 12.5, row.x1 - 10.0, y, weak);
                     let stripes = branch_stripes(ui, row.x1 - 18.0 - age_width.max(44.0), y, branches, lit, appear);
-                    let room = row.width() - 18.0 - age_width.max(44.0) - stripes - 16.0;
-                    ui.line(&repo.name, Face::Body, 14.0, row.x0 + 10.0 + shift, y, room, ink);
+                    // Кольцо: в проекте есть что отправить или закоммитить. Подробности в обзоре.
+                    let pending = repo.health.as_ref().is_some_and(|h| h.unpushed > 0 || h.dirty > 0);
+                    let mark = if pending { 14.0 } else { 0.0 };
+                    if pending {
+                        let dot = Circle::new((row.x0 + 14.0 + shift, y), 3.5);
+                        ui.stroke(&dot, 2.0, mix(pal.lines[0], pal.sheet, lit));
+                    }
+                    let room = row.width() - 18.0 - age_width.max(44.0) - stripes - 16.0 - mark;
+                    ui.line(&repo.name, Face::Body, 14.0, row.x0 + 10.0 + shift + mark, y, room, ink);
                     if response.focused {
                         ui.focus_ring(row, 9.0);
                     }
@@ -215,6 +252,9 @@ pub fn show(ui: &mut Ui, app: &mut App, rect: Rect) {
     });
     if let Some(path) = open_path {
         app.open_repo(path, false);
+    }
+    if go_overview {
+        app.close_repo(now);
     }
     if let Some(group) = toggle
         && !app.settings.collapsed.remove(&group)

@@ -13,6 +13,7 @@ use crate::layout::{LANE, Line as MapLine, LineKind, Map, TickLevel};
 use crate::text::{self, Face};
 use crate::theme::{fade, mix};
 use crate::ui::{Cursor, Key, Ui, id, polyline};
+use std::collections::{HashMap, HashSet};
 use std::f64::consts::FRAC_PI_4;
 use vello::kurbo::{Affine, BezPath, Cap, Circle, Join, Line, Point, Rect, RoundedRect, Stroke, Vec2};
 use vello::peniko::{Color, Fill};
@@ -93,6 +94,9 @@ pub struct Motion {
     pub auto_frame: bool,
     tooltip: Option<Hit>,
     tooltip_amount: f32,
+    /// Линии, дорастающие до новых коммитов: откуда и с какого момента.
+    extend: HashMap<usize, (f64, f64)>,
+    follow_tip: bool,
 }
 
 impl Motion {
@@ -114,7 +118,32 @@ impl Motion {
             auto_frame: true,
             tooltip: None,
             tooltip_amount: 0.0,
+            extend: HashMap::new(),
+            follow_tip: false,
         }
+    }
+
+    /// Репозиторий перечитан: всё остаётся на месте, новое подъезжает на линию.
+    pub fn absorb(&mut self, map: &Map, fresh: &HashSet<Idx>, now: f64) {
+        self.lit = vec![1.0; map.lines.len()];
+        self.peek = None;
+        self.tooltip = None;
+        self.press = None;
+        let t = (now - self.opened.unwrap_or(now)) as f32;
+        self.starts = map.lines.iter().map(|l| if l.commits.iter().all(|c| fresh.contains(c)) { t } else { -10.0 }).collect();
+        self.extend.clear();
+        for (id, line) in map.lines.iter().enumerate() {
+            let last = line.commits[line.commits.len() - 1];
+            if fresh.contains(&last)
+                && let Some(known) = line.commits.iter().rev().find(|c| !fresh.contains(c))
+            {
+                self.extend.insert(id, (map.x[*known as usize] as f64, now));
+            }
+        }
+        for &commit in fresh.iter().take(6) {
+            self.ripples.push((commit, now + 0.35));
+        }
+        self.follow_tip = self.auto_frame && !fresh.is_empty();
     }
 
     /// Волна от станции: выбор коммита виден на схеме, откуда бы он ни пришёл.
@@ -177,6 +206,29 @@ impl View {
 enum Hit {
     Commit(Idx),
     Line(u32),
+    Work,
+}
+
+/// Незакоммиченная работа: пунктирный отросток от HEAD. Он не лежит на дорожке,
+/// потому что это ещё не история.
+fn ghost(s: &Session, view: &View) -> Option<(Point, Point)> {
+    if s.work.is_empty() {
+        return None;
+    }
+    let head = s.graph.head.filter(|&h| s.map.is_visible(h))?;
+    let lane = s.map.lines[s.map.line_of[head as usize] as usize].lane;
+    let reach = 40.0 * view.zy.clamp(0.7, 1.2);
+    let side = if lane < 0 { -1.0 } else { 1.0 };
+    let p = view.at(&s.map, head);
+    Some((p, p + Vec2::new(reach, reach * side)))
+}
+
+/// Докуда линия дошла сейчас: новые коммиты подъезжают, а не появляются скачком.
+fn tip_x(s: &Session, id: usize, x1: f64, now: f64) -> f64 {
+    match s.motion.extend.get(&id) {
+        Some(&(from, start)) => from + (x1 - from) * ease_out(((now - start) / 0.7) as f32) as f64,
+        None => x1,
+    }
 }
 
 fn fit_zoom(map: &Map, free: Rect) -> f64 {
@@ -368,12 +420,15 @@ fn focused_line(s: &Session) -> Option<u32> {
     match s.selection {
         Selection::Line(line) => Some(line),
         Selection::Commit(commit) => Some(s.map.line_of[commit as usize]),
-        Selection::None => s.motion.peek,
+        Selection::None | Selection::Work => s.motion.peek,
     }
 }
 
 fn hit_test(s: &Session, view: &View, pos: Point) -> Option<Hit> {
     let map = &s.map;
+    if ghost(s, view).is_some_and(|(_, q)| (q - pos).hypot() < 14.0) {
+        return Some(Hit::Work);
+    }
     let lane = (view.wy(pos.y) / LANE as f64).round() as i32;
     if (view.sy(map.lane_y(lane) as f64) - pos.y).abs() > 14.0 {
         return None;
@@ -436,14 +491,27 @@ fn handle_input(ui: &mut Ui, s: &mut Session, free: Rect, hit: Option<Hit>) {
         if let (Some(start), Some(p)) = (motion.press, ui.input.pointer) {
             let moved = (p - start).hypot();
             if moved < 4.0 {
-                let next = match hit {
-                    Some(Hit::Commit(commit)) => Selection::Commit(commit),
-                    Some(Hit::Line(line)) => Selection::Line(line),
-                    None => Selection::None,
-                };
-                s.select(next);
-                if let Selection::Commit(commit) = next {
-                    s.motion.ripples.push((commit, ui.input.time));
+                let now = ui.input.time;
+                if let (Some(from), Some(Hit::Commit(commit))) = (s.compare_from, hit) {
+                    s.compare_from = None;
+                    s.motion.ripples.push((commit, now));
+                    if from != commit {
+                        s.compare(from, commit, now);
+                    }
+                } else {
+                    let next = match hit {
+                        Some(Hit::Commit(commit)) => Selection::Commit(commit),
+                        Some(Hit::Line(line)) => Selection::Line(line),
+                        Some(Hit::Work) => Selection::Work,
+                        None => Selection::None,
+                    };
+                    if next != s.selection {
+                        s.page_changed = now;
+                    }
+                    s.select(next);
+                    if let Selection::Commit(commit) = next {
+                        s.motion.ripples.push((commit, now));
+                    }
                 }
             } else {
                 // Схема катится ещё немного: цель уходит вперёд по скорости руки.
@@ -514,6 +582,11 @@ pub fn show(ui: &mut Ui, s: &mut Session, free: Rect, alpha: f32) {
         s.motion.camera.jump(shot);
         s.motion.framed_for = size;
     }
+    if s.motion.follow_tip {
+        s.motion.follow_tip = false;
+        let shot = latest(&s.map, free);
+        s.motion.camera.aim(shot);
+    }
     let dt = ui.input.dt;
     let view = View::of(free, &s.motion.camera);
     if s.motion.opened.is_none() {
@@ -521,7 +594,8 @@ pub fn show(ui: &mut Ui, s: &mut Session, free: Rect, alpha: f32) {
     }
     let pointer = ui.input.pointer.filter(|p| !ui.covered(*p) && p.y > TOP_BAND && !timeline_rect(free).contains(*p));
     let hit = pointer.and_then(|p| hit_test(s, &view, p));
-    if hit.is_some() && !ui.any_active() {
+    let choosing = pointer.is_some() && s.compare_from.is_some();
+    if (hit.is_some() || choosing) && !ui.any_active() {
         ui.cursor = Cursor::Pointer;
     } else if pointer.is_some() && !ui.any_active() {
         ui.cursor = Cursor::Grab;
@@ -550,6 +624,7 @@ pub fn show(ui: &mut Ui, s: &mut Session, free: Rect, alpha: f32) {
     paint_trains(ui, s, &view, t);
     paint_labels(ui, s, &view, t);
     paint_marks(ui, s, &view, &hit, t);
+    paint_work(ui, s, &view, t);
     paint_ruler(ui, s, &view);
     paint_title(ui, s, &view, t);
     paint_timeline(ui, s, free, &view, t);
@@ -564,7 +639,7 @@ fn update_focus(ui: &mut Ui, s: &mut Session, hit: Option<Hit>, pointer: Option<
     let peek_from_map = match hit {
         Some(Hit::Line(line)) => Some(line),
         Some(Hit::Commit(commit)) => Some(s.map.line_of[commit as usize]),
-        None => None,
+        Some(Hit::Work) | None => None,
     };
     if pointer.is_some() {
         s.motion.peek = peek_from_map;
@@ -598,6 +673,10 @@ fn update_focus(ui: &mut Ui, s: &mut Session, hit: Option<Hit>, pointer: Option<
     }
     motion.ripples.retain(|(_, start)| ui.input.time - start < 0.7);
     if !motion.ripples.is_empty() {
+        ui.animating = true;
+    }
+    motion.extend.retain(|_, (_, start)| ui.input.time - *start < 0.75);
+    if !motion.extend.is_empty() {
         ui.animating = true;
     }
 }
@@ -692,6 +771,7 @@ fn paint_lines(ui: &mut Ui, s: &Session, view: &View, t: f32) {
                 continue;
             }
             let (x0, x1) = line_ends(map, line);
+            let x1 = tip_x(s, id, x1, ui.input.time);
             let (mut a, mut b) = (view.sx(x0), view.sx(x1));
             if kind == LineKind::Main {
                 // Дальше конца основной линии центр схемы идёт пунктиром.
@@ -772,12 +852,13 @@ fn paint_stations(ui: &mut Ui, s: &Session, view: &View, t: f32) {
         let mut last_ring = f64::MIN;
         let terminal = line.commits[line.commits.len() - 1];
         let (x0, x1) = line_ends(map, line);
+        let reached = tip_x(s, id, x1, ui.input.time);
         let (amount, _) = grown(s, id, t);
         let share = clamp01((amount - 0.34) / 0.66);
         let mut path = BezPath::new();
         for &commit in &line.commits[from..] {
             let wx = map.x[commit as usize];
-            if wx > right {
+            if wx > right || wx as f64 > reached + 0.5 {
                 break;
             }
             let x = view.sx(wx as f64);
@@ -839,6 +920,7 @@ fn paint_stations(ui: &mut Ui, s: &Session, view: &View, t: f32) {
             }
         };
         let (x0, x1) = line_ends(map, line);
+        let x1 = tip_x(s, id, x1, ui.input.time);
         if line.kind == LineKind::Main {
             bar(ui, view.sx(x0), clamp01(t / 0.2));
             bar(ui, view.sx(x1), if main_front >= x1 { clamp01((t - SWEEP * 0.6) / 0.25) } else { 0.0 });
@@ -939,7 +1021,7 @@ fn paint_labels(ui: &mut Ui, s: &Session, view: &View, t: f32) {
         }
         let y = view.sy(map.lane_y(line.lane) as f64);
         let (x0, x1) = line_ends(map, line);
-        let (a, b) = (view.sx(x0), view.sx(x1));
+        let (a, b) = (view.sx(x0), view.sx(tip_x(s, id, x1, ui.input.time)));
         if y < TOP_BAND + 20.0 || y > h || b < free.x0 || a > free.x1 {
             continue;
         }
@@ -1043,6 +1125,36 @@ fn paint_labels(ui: &mut Ui, s: &Session, view: &View, t: f32) {
     }
 }
 
+/// Отросток незакоммиченной работы: ещё не история, поэтому пунктир и пустое кольцо.
+fn paint_work(ui: &mut Ui, s: &Session, view: &View, t: f32) {
+    let Some((p, q)) = ghost(s, view) else { return };
+    let appear = clamp01((t - SWEEP - 0.3) / 0.4);
+    if appear <= 0.0 || !view.free.contains(q) {
+        return;
+    }
+    let pal = ui.pal;
+    let flow = Stroke::new(2.5).with_caps(Cap::Round).with_dashes(-(ui.input.time * 18.0), [1.0, 7.0]);
+    ui.scene.stroke(&flow, Affine::IDENTITY, fade(pal.ink, appear), None, &Line::new(p, q));
+    if !ui.calm {
+        ui.ambient = true;
+    }
+    let selected = s.selection == Selection::Work;
+    let ring = Circle::new(q, 7.5 * ease_back(appear) as f64);
+    ui.fill(&ring, if selected { pal.ink } else { pal.sheet });
+    let dashes = Stroke::new(2.0).with_dashes(0.0, [3.0, 3.0]);
+    ui.scene.stroke(&dashes, Affine::IDENTITY, fade(pal.ink, appear), None, &ring);
+    let label = fmt::count(s.work.len(), "файл не в коммите", "файла не в коммите", "файлов не в коммите");
+    let layout = ui.fonts.layout(&label, Face::Body, 12.5, None);
+    let fits = q.x + 13.0 + layout.width() as f64 + 8.0 < view.free.x1;
+    let at = if fits {
+        q + Vec2::new(13.0, -layout.height() as f64 / 2.0)
+    } else {
+        q + Vec2::new(8.0 - layout.width() as f64, 12.0)
+    };
+    text::halo(ui.scene, &layout, Affine::translate(at.to_vec2()), fade(pal.ground, appear), 3.0);
+    text::draw(ui.scene, &layout, Affine::translate(at.to_vec2()), fade(pal.ink, appear));
+}
+
 /// Выделение, найденное, положение HEAD и волна от щелчка.
 fn paint_marks(ui: &mut Ui, s: &Session, view: &View, hit: &Option<Hit>, t: f32) {
     let map = &s.map;
@@ -1072,6 +1184,9 @@ fn paint_marks(ui: &mut Ui, s: &Session, view: &View, hit: &Option<Hit>, t: f32)
     }
     for &(commit, start) in &s.motion.ripples {
         let phase = ((now - start) / 0.7) as f32;
+        if phase < 0.0 {
+            continue;
+        }
         let ring = Circle::new(view.at(map, commit), 10.0 + 38.0 * ease_out(phase) as f64);
         ui.stroke(&ring, 2.5, fade(pal.ink, 0.65 * (1.0 - phase)));
     }
@@ -1185,6 +1300,11 @@ fn paint_tooltip(ui: &mut Ui, s: &mut Session, view: &View, hit: Option<Hit>, po
             let name = if line.name.is_empty() { "Ветка без имени".to_owned() } else { line.name.clone() };
             let anchor = pointer.unwrap_or(view.center);
             (name, fmt::count(line.commits.len(), "коммит", "коммита", "коммитов"), anchor)
+        }
+        Hit::Work => {
+            let anchor = ghost(s, view).map_or(view.center, |(_, q)| q);
+            let meta = fmt::count(s.work.len(), "файл изменён", "файла изменено", "файлов изменено");
+            ("Незакоммиченная работа".to_owned(), meta, anchor)
         }
     };
     let head = ui.fonts.layout(&title, Face::Semi, 14.0, Some(380.0));

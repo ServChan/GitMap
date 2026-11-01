@@ -16,7 +16,7 @@ use vello::peniko::Fill;
 use vello::util::{RenderContext, RenderSurface};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, StartCause, WindowEvent};
+use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key as WinitKey, ModifiersState, NamedKey};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -136,8 +136,40 @@ impl Shell<'_> {
                 WindowCommand::Drag => {
                     let _ = window.drag_window();
                 }
+                WindowCommand::SavePng(path) => self.save_png(&path),
             }
         }
+    }
+
+    /// Снимок текущей схемы без панелей, в двойном разрешении.
+    fn save_png(&mut self, path: &std::path::Path) {
+        let size = self.logical_size();
+        let pal = self.palette();
+        let Root::Main(app) = &mut self.root else { return };
+        let input = Input { time: self.input.time, ..Input::default() };
+        self.scene.reset();
+        self.scene.fill(Fill::NonZero, Affine::IDENTITY, pal.ground, None, &Rect::new(0.0, 0.0, size.0, size.1));
+        app.map_only = true;
+        {
+            let mut ui = Ui::new(&mut self.scene, &mut self.fonts, &input, &mut self.state, pal, size, true);
+            app.frame(&mut ui);
+        }
+        app.map_only = false;
+        self.outer.reset();
+        self.outer.append(&self.scene, Some(Affine::scale(2.0)));
+        let result = match &mut self.gpu {
+            Some(gpu) => gpu.render_png(&self.outer, (size.0 * 2.0) as u32, (size.1 * 2.0) as u32, pal.ground, path),
+            None => Err("видеокарта не готова".to_owned()),
+        };
+        let now = self.input.time;
+        app.notify(
+            match result {
+                Ok(()) => format!("Схема сохранена: {}", path.display()),
+                Err(error) => format!("Не удалось сохранить схему: {error}"),
+            },
+            now,
+        );
+        self.redraw();
     }
 
     fn close(&mut self, event_loop: &ActiveEventLoop) {
@@ -329,6 +361,7 @@ impl ApplicationHandler for Shell<'_> {
         }
         let window = Arc::new(event_loop.create_window(attributes).expect("окно не создано"));
         round_corners(&window);
+        window.set_ime_allowed(true);
         self.system_dark = window.theme() == Some(Theme::Dark);
         self.sync_theme();
         self.focused = true;
@@ -372,6 +405,13 @@ impl ApplicationHandler for Shell<'_> {
                 {
                     gpu.context.resize_surface(surface, size.width, size.height);
                 }
+                // Кадр сразу, а не по очереди: при растягивании окна нет пустых полос.
+                if self.shown && size.width > 0 && size.height > 0 {
+                    self.frame(event_loop);
+                }
+            }
+            WindowEvent::Ime(Ime::Commit(text)) => {
+                self.input.text.push_str(&text);
                 self.redraw();
             }
             WindowEvent::ScaleFactorChanged { .. } | WindowEvent::Occluded(false) => self.redraw(),

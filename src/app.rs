@@ -2,13 +2,15 @@
 //! поверх неё листы указателя и сведений.
 
 use crate::anim::{self, ease_out};
-use crate::git::{self, Details, Graph, Idx, RefKind, Summary, branch_name};
+use crate::diff::{DiffView, Request};
+use crate::git::{self, Details, FileChange, FileDiff, Graph, Health, Idx, RefKind, Summary, branch_name};
 use crate::layout::{self, LineKind, Map, Options};
 use crate::map::{self, Motion};
 use crate::text::Face;
 use crate::theme::{DARK, LIGHT, Palette, fade};
 use crate::ui::{Key, Tone, Ui, id};
-use crate::{fmt, index, install, panel, scan, update};
+use crate::watch::{self, Watcher};
+use crate::{actions, diff, export, fmt, index, install, overview, panel, scan, update};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -113,6 +115,8 @@ pub enum Selection {
     None,
     Commit(Idx),
     Line(u32),
+    /// Незакоммиченная работа.
+    Work,
 }
 
 pub struct Repo {
@@ -120,6 +124,9 @@ pub struct Repo {
     pub name: String,
     pub group: String,
     pub summary: Option<Result<Summary, String>>,
+    pub health: Option<Health>,
+    /// Голый репозиторий: зеркало или резервная копия, а не рабочий проект.
+    pub bare: bool,
     pub found_at: f64,
 }
 
@@ -145,6 +152,13 @@ pub struct Session {
     pub show_all_merged: bool,
     /// Когда сменилась страница правой панели.
     pub page_changed: f64,
+    /// Незакоммиченные файлы: на схеме это пунктирная станция после HEAD.
+    pub work: Vec<FileChange>,
+    pub diff: Option<DiffView>,
+    pub want_diff: Option<Request>,
+    diff_generation: u64,
+    /// Первый коммит сравнения: следующий щелчок по схеме выберет второй.
+    pub compare_from: Option<Idx>,
 }
 
 pub struct LineStats {
@@ -194,6 +208,11 @@ impl Session {
             line_stats: None,
             show_all_merged: false,
             page_changed: 0.0,
+            work: Vec::new(),
+            diff: None,
+            want_diff: None,
+            diff_generation: 0,
+            compare_from: None,
         };
         session.rebuild_labels(show_tags);
         session
@@ -229,8 +248,56 @@ impl Session {
         match selection {
             Selection::Commit(commit) => self.want_details = Some(commit),
             Selection::Line(line) => self.compute_line_stats(line),
-            Selection::None => {}
+            Selection::None | Selection::Work => {}
         }
+    }
+
+    pub fn open_diff(&mut self, title: String, request: Request, prefer: Option<String>, now: f64) {
+        self.diff_generation += 1;
+        self.want_diff = Some(request);
+        self.diff = Some(DiffView { title, files: None, selected: 0, opened: now, closing: None, prefer });
+    }
+
+    /// Сравнение двух коммитов: старый всегда слева, как бы их ни выбрали.
+    pub fn compare(&mut self, a: Idx, b: Idx, now: f64) {
+        let commits = &self.graph.commits;
+        let (old, new) = if commits[a as usize].time <= commits[b as usize].time { (a, b) } else { (b, a) };
+        let (from, to) = (commits[old as usize].id, commits[new as usize].id);
+        let title = format!("{} и {}", from.to_hex_with_len(8), to.to_hex_with_len(8));
+        self.open_diff(title, Request::Commits { from: Some(from), to }, None, now);
+    }
+
+    /// Репозиторий перечитан: вид, выбор и поиск остаются, новые коммиты подъезжают на линию.
+    fn adopt(&mut self, previous: Session, now: f64) {
+        let old_ids: HashSet<_> = previous.graph.commits.iter().map(|c| c.id).collect();
+        let index: HashMap<_, Idx> = self.graph.commits.iter().enumerate().map(|(i, c)| (c.id, i as Idx)).collect();
+        let remap = |commit: Idx| index.get(&previous.graph.commits[commit as usize].id).copied();
+        self.selection = match previous.selection {
+            Selection::Commit(commit) => remap(commit).map_or(Selection::None, Selection::Commit),
+            Selection::Line(line) => {
+                let name = &previous.map.lines[line as usize].name;
+                let found = self.map.lines.iter().position(|l| !name.is_empty() && l.name == *name);
+                found.map_or(Selection::None, |id| Selection::Line(id as u32))
+            }
+            other => other,
+        };
+        self.back = None;
+        self.search = previous.search;
+        self.work = previous.work;
+        self.diff = previous.diff;
+        self.diff_generation = previous.diff_generation;
+        self.show_all_merged = previous.show_all_merged;
+        self.details = None;
+        match self.selection {
+            Selection::Commit(commit) => self.want_details = Some(commit),
+            Selection::Line(line) => self.compute_line_stats(line),
+            _ => {}
+        }
+        self.run_search();
+        self.motion = previous.motion;
+        let fresh: HashSet<Idx> =
+            self.graph.commits.iter().enumerate().filter(|(_, c)| !old_ids.contains(&c.id)).map(|(i, _)| i as Idx).collect();
+        self.motion.absorb(&self.map, &fresh, now);
     }
 
     fn compute_line_stats(&mut self, id: u32) {
@@ -285,14 +352,33 @@ enum Msg {
     Picked(PathBuf),
     UpdateChecked { manual: bool, result: Result<Option<update::Manifest>, String> },
     UpdateDownloaded(Result<PathBuf, String>),
+    Health { path: PathBuf, health: Health },
+    Watch(watch::Event),
+    Diff { generation: u64, result: Result<Vec<FileDiff>, String> },
+    Notice(String),
+    SavePng(PathBuf),
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum WindowCommand {
     Close,
     Minimize,
     ToggleMaximize,
     Drag,
+    /// Снять текущую схему без панелей, в двойном разрешении.
+    SavePng(PathBuf),
+}
+
+/// Что попросила панель: выполняется снаружи, потому что выходит за пределы окна.
+#[derive(Clone, PartialEq)]
+pub enum Action {
+    Editor,
+    Terminal,
+    Folder,
+    Web(String),
+    ExportPng,
+    ExportSvg,
+    Open(PathBuf),
 }
 
 pub struct App {
@@ -324,6 +410,14 @@ pub struct App {
     pub system_dark: bool,
     started: f64,
     pending_start: Option<PathBuf>,
+    watcher: Watcher,
+    /// Проекты с общей историей: индексы в `repos`.
+    pub families: Vec<Vec<usize>>,
+    pub overview_opened: f64,
+    pub overview_expanded: HashSet<&'static str>,
+    notice: Option<(String, f64)>,
+    /// Кадр для выгрузки: только схема, без панелей.
+    pub map_only: bool,
 }
 
 pub struct StartArgs {
@@ -344,8 +438,13 @@ impl App {
                     let next = queue.lock().ok().and_then(|q| q.recv().ok());
                     let Some(path) = next else { return };
                     let result = git::summary(&path);
-                    let _ = tx.send(Msg::Summary { path, result });
+                    let _ = tx.send(Msg::Summary { path: path.clone(), result });
                     waker();
+                    // Состояние считается отдельно: оно дольше, а список нужен сразу.
+                    if let Ok(health) = git::health(&path) {
+                        let _ = tx.send(Msg::Health { path, health });
+                        waker();
+                    }
                 }
             });
         }
@@ -357,6 +456,13 @@ impl App {
             Some("light") => Some(ThemeChoice::Light),
             Some("dark") => Some(ThemeChoice::Dark),
             _ => None,
+        };
+        let watcher = {
+            let (tx, waker) = (tx.clone(), waker.clone());
+            Watcher::start(move |event| {
+                let _ = tx.send(Msg::Watch(event));
+                waker();
+            })
         };
         let mut app = Self {
             tx,
@@ -384,6 +490,12 @@ impl App {
             system_dark: false,
             started: 0.0,
             pending_start: None,
+            watcher,
+            families: Vec::new(),
+            overview_opened: 0.0,
+            overview_expanded: HashSet::new(),
+            notice: None,
+            map_only: false,
         };
         if app.can_update {
             std::thread::spawn(install::clean_downloaded_updates);
@@ -426,6 +538,9 @@ impl App {
         self.load_error = None;
         self.scanning = true;
         self.started = now;
+        self.overview_opened = now;
+        self.families.clear();
+        self.watcher.follow(None);
         let generation = self.scan_generation;
         let (cancel, tx, waker) = (self.scan_cancel.clone(), self.tx.clone(), self.waker.clone());
         std::thread::spawn(move || {
@@ -446,6 +561,7 @@ impl App {
         self.load_error = None;
         self.open_path = Some(path.clone());
         self.empty_repo = None;
+        self.watcher.follow(Some(path.clone()));
         let generation = self.load_generation;
         let options = self.layout_options();
         let (tx, waker) = (self.tx.clone(), self.waker.clone());
@@ -457,6 +573,113 @@ impl App {
             let _ = tx.send(Msg::Loaded { generation, path, keep_view, result });
             waker();
         });
+    }
+
+    /// Назад к обзору папки.
+    pub fn close_repo(&mut self, now: f64) {
+        self.load_generation += 1;
+        self.loading = false;
+        self.session = None;
+        self.open_path = None;
+        self.empty_repo = None;
+        self.load_error = None;
+        self.overview_opened = now;
+        self.watcher.follow(None);
+    }
+
+    /// Родство считается по общим корневым коммитам.
+    fn rebuild_families(&mut self) {
+        let mut by_root: HashMap<gix::ObjectId, Vec<usize>> = HashMap::new();
+        for (i, repo) in self.repos.iter().enumerate().filter(|(_, r)| !r.bare) {
+            for root in repo.health.iter().flat_map(|h| &h.roots) {
+                by_root.entry(*root).or_default().push(i);
+            }
+        }
+        // Проект может делить историю с разными соседями: собираем связные группы.
+        let mut parent: Vec<usize> = (0..self.repos.len()).collect();
+        fn find(parent: &mut [usize], mut at: usize) -> usize {
+            while parent[at] != at {
+                parent[at] = parent[parent[at]];
+                at = parent[at];
+            }
+            at
+        }
+        for members in by_root.values() {
+            for pair in members.windows(2) {
+                let (a, b) = (find(&mut parent, pair[0]), find(&mut parent, pair[1]));
+                parent[a] = b;
+            }
+        }
+        let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
+        for i in 0..self.repos.len() {
+            if self.repos[i].health.is_some() && !self.repos[i].bare {
+                groups.entry(find(&mut parent, i)).or_default().push(i);
+            }
+        }
+        let mut families: Vec<Vec<usize>> = groups.into_values().filter(|g| g.len() > 1).collect();
+        for family in &mut families {
+            family.sort_by_key(|&i| self.repos[i].name.to_lowercase());
+        }
+        families.sort_by_key(|f| (std::cmp::Reverse(f.len()), self.repos[f[0]].name.to_lowercase()));
+        self.families = families;
+    }
+
+    fn run_action(&mut self, action: Action) {
+        let path = self.open_path.clone();
+        let tx = self.tx.clone();
+        let waker = self.waker.clone();
+        let report = move |result: Result<(), String>| {
+            if let Err(error) = result {
+                let _ = tx.send(Msg::Notice(error));
+                waker();
+            }
+        };
+        match action {
+            Action::Open(path) => self.open_repo(path, false),
+            Action::Web(url) => report(actions::open_url(&url)),
+            Action::Folder | Action::Editor | Action::Terminal => {
+                let Some(path) = path else { return };
+                // Запуск внешней программы может подумать: окно не должно ждать.
+                std::thread::spawn(move || {
+                    report(match action {
+                        Action::Folder => actions::open_folder(&path),
+                        Action::Editor => actions::open_editor(&path),
+                        _ => actions::open_terminal(&path),
+                    });
+                });
+            }
+            Action::ExportSvg => {
+                let Some(session) = &self.session else { return };
+                let (svg, name) = (export::svg(session, self.palette()), session.title.clone());
+                let (tx, waker) = (self.tx.clone(), self.waker.clone());
+                std::thread::spawn(move || {
+                    let picked = rfd::FileDialog::new().add_filter("SVG", &["svg"]).set_file_name(format!("{name}.svg")).save_file();
+                    let Some(path) = picked else { return };
+                    let text = match std::fs::write(&path, svg) {
+                        Ok(()) => format!("Схема сохранена: {}", path.display()),
+                        Err(error) => format!("Не удалось сохранить схему: {error}"),
+                    };
+                    let _ = tx.send(Msg::Notice(text));
+                    waker();
+                });
+            }
+            Action::ExportPng => {
+                let Some(session) = &self.session else { return };
+                let name = session.title.clone();
+                let (tx, waker) = (self.tx.clone(), self.waker.clone());
+                std::thread::spawn(move || {
+                    let picked = rfd::FileDialog::new().add_filter("PNG", &["png"]).set_file_name(format!("{name}.png")).save_file();
+                    if let Some(path) = picked {
+                        let _ = tx.send(Msg::SavePng(path));
+                        waker();
+                    }
+                });
+            }
+        }
+    }
+
+    pub fn notify(&mut self, text: String, now: f64) {
+        self.notice = Some((text, now));
     }
 
     fn layout_options(&self) -> Options {
@@ -528,7 +751,8 @@ impl App {
                         self.reveal_open = true;
                         self.open_repo(path.clone(), false);
                     }
-                    self.repos.push(Repo { path, name, group, summary: None, found_at: now });
+                    let bare = !path.join(".git").exists();
+                    self.repos.push(Repo { path, name, group, summary: None, health: None, bare, found_at: now });
                 }
                 Msg::ScanDone { generation } if generation == self.scan_generation => self.scanning = false,
                 Msg::Summary { path, result } => {
@@ -543,8 +767,7 @@ impl App {
                             let previous = self.session.take().filter(|_| keep_view);
                             let mut session = Session::new(graph, map, &path, self.settings.show_tags);
                             if let Some(previous) = previous {
-                                session.motion = previous.motion;
-                                session.motion.replay(&session.map);
+                                session.adopt(previous, now);
                             }
                             self.session = Some(session);
                         }
@@ -579,6 +802,45 @@ impl App {
                     }
                 }
                 Msg::Picked(path) => self.start_scan(path, now),
+                Msg::Health { path, health } => {
+                    if let Some(repo) = self.repos.iter_mut().find(|r| r.path == path) {
+                        repo.health = Some(health);
+                    }
+                    self.rebuild_families();
+                }
+                Msg::Watch(watch::Event::Changed(path)) => {
+                    if self.open_path.as_ref() == Some(&path) && !self.loading {
+                        self.open_repo(path, true);
+                    }
+                }
+                Msg::Watch(watch::Event::Work(path, files)) => {
+                    if let Some(repo) = self.repos.iter_mut().find(|r| r.path == path)
+                        && let Some(health) = &mut repo.health
+                    {
+                        health.dirty = files.len();
+                    }
+                    if let Some(session) = &mut self.session
+                        && self.open_path.as_ref() == Some(&path)
+                    {
+                        session.work = files;
+                        if session.work.is_empty() && session.selection == Selection::Work {
+                            session.select(Selection::None);
+                        }
+                    }
+                }
+                Msg::Diff { generation, result } => {
+                    if let Some(session) = &mut self.session
+                        && session.diff_generation == generation
+                        && let Some(view) = &mut session.diff
+                    {
+                        if let (Ok(files), Some(prefer)) = (&result, &view.prefer) {
+                            view.selected = files.iter().position(|f| f.path == *prefer).unwrap_or(0);
+                        }
+                        view.files = Some(result);
+                    }
+                }
+                Msg::Notice(text) => self.notify(text, now),
+                Msg::SavePng(path) => self.commands.push(WindowCommand::SavePng(path)),
                 Msg::UpdateChecked { manual, result } => {
                     self.settings.last_update_check = update::now_secs();
                     match result {
@@ -606,7 +868,25 @@ impl App {
         }
     }
 
+    fn fetch_diff(&mut self) {
+        let Some(session) = &mut self.session else { return };
+        let Some(request) = session.want_diff.take() else { return };
+        let (path, generation) = (session.graph.path.clone(), session.diff_generation);
+        let (tx, waker) = (self.tx.clone(), self.waker.clone());
+        std::thread::spawn(move || {
+            let result = match request {
+                Request::Commits { from, to } => git::diff_commits(&path, from, to),
+                Request::Worktree => git::diff_worktree(&path),
+                Request::Branch { main, tip } => git::merge_base(&path, main, tip)
+                    .and_then(|base| git::diff_commits(&path, Some(base.unwrap_or(main)), tip)),
+            };
+            let _ = tx.send(Msg::Diff { generation, result });
+            waker();
+        });
+    }
+
     fn fetch_details(&mut self) {
+        self.fetch_diff();
         let Some(session) = &mut self.session else { return };
         let Some(commit) = session.want_details.take() else { return };
         let (path, id) = (session.graph.path.clone(), session.graph.commits[commit as usize].id);
@@ -632,6 +912,12 @@ impl App {
         }
         self.drain(now);
         let (w, h) = ui.size;
+        if self.map_only {
+            if let Some(session) = &mut self.session {
+                map::show(ui, session, Rect::new(0.0, 0.0, w, h), 1.0);
+            }
+            return;
+        }
         if ui.input.key(Key::F5)
             && let Some(path) = self.open_path.clone()
         {
@@ -648,12 +934,18 @@ impl App {
         if opened {
             ui.covers.push(panel_rect);
         }
+        if let Some(session) = &self.session
+            && session.diff.is_some()
+        {
+            ui.covers.push(diff::sheet_rect(free));
+        }
         self.canvas(ui, free);
         self.caption_buttons(ui, free);
         index::show(ui, self, index_rect);
         let mut options = self.layout_options();
+        let info = self.panel_info();
         if let Some(session) = &mut self.session {
-            let change = panel::show(ui, session, &mut options, &mut self.settings.show_tags, panel_rect, free);
+            let change = panel::show(ui, session, &mut options, &mut self.settings.show_tags, panel_rect, free, &info);
             self.settings.show_merged = options.show_merged;
             self.settings.compress = options.compress;
             if change.relayout {
@@ -664,9 +956,47 @@ impl App {
             {
                 session.rebuild_labels(self.settings.show_tags);
             }
+            if let Some(action) = change.action {
+                self.run_action(action);
+            }
         }
+        if let Some(session) = &mut self.session {
+            diff::show(ui, session, free);
+        }
+        self.paint_notice(ui, free);
         self.fetch_details();
         ui.finish();
+    }
+
+    fn panel_info(&self) -> panel::Info {
+        let repo = self.repos.iter().position(|r| Some(&r.path) == self.open_path.as_ref());
+        let web_url = repo.and_then(|i| self.repos[i].health.as_ref()).and_then(|h| h.web_url.clone());
+        let family = repo
+            .and_then(|i| self.families.iter().find(|f| f.contains(&i)).map(|f| (i, f)))
+            .map(|(i, f)| {
+                f.iter().filter(|&&m| m != i).map(|&m| (self.repos[m].name.clone(), self.repos[m].path.clone())).collect()
+            })
+            .unwrap_or_default();
+        panel::Info { web_url, family }
+    }
+
+    /// Короткое сообщение внизу схемы: выезжает, держится и уходит само.
+    fn paint_notice(&mut self, ui: &mut Ui, free: Rect) {
+        const SHOWN: f64 = 4.0;
+        let Some((text, start)) = self.notice.clone() else { return };
+        let age = ui.now() - start;
+        if age > SHOWN {
+            self.notice = None;
+            return;
+        }
+        ui.animating = true;
+        let pal = ui.pal;
+        let phase = ease_out((age / 0.28) as f32).min(ease_out(((SHOWN - age) / 0.28) as f32));
+        let width = (ui.fonts.width(&text, Face::Body, 14.0) as f64 + 36.0).min(free.width() - 40.0);
+        let y = free.y1 - 124.0 + (1.0 - phase) as f64 * 16.0;
+        let rect = Rect::from_origin_size((free.center().x - width / 2.0, y), (width, 40.0));
+        ui.sheet(rect, 10.0, phase);
+        ui.line(&text, Face::Body, 14.0, rect.x0 + 18.0, rect.center().y, width - 36.0, fade(pal.ink, phase));
     }
 
     fn canvas(&mut self, ui: &mut Ui, free: Rect) {
@@ -678,10 +1008,16 @@ impl App {
             self.placeholder(ui, free, &open_title, &format!("Не удалось прочитать репозиторий: {error}"), None);
         } else if self.session.is_some() {
             if let Some(session) = &mut self.session {
-                map::handle_keys(ui, session, free);
-                if ui.input.key(Key::Escape) {
-                    let target = session.back.map_or(Selection::None, Selection::Line);
-                    session.select(target);
+                if session.diff.is_none() {
+                    map::handle_keys(ui, session, free);
+                    if ui.input.key(Key::Escape) {
+                        if session.compare_from.is_some() {
+                            session.compare_from = None;
+                        } else {
+                            let target = session.back.map_or(Selection::None, Selection::Line);
+                            session.select(target);
+                        }
+                    }
                 }
                 map::show(ui, session, free, 1.0);
             }
@@ -695,17 +1031,15 @@ impl App {
             if self.placeholder(ui, free, "Карта веток", body, Some("Выбрать папку")) {
                 self.pick_folder();
             }
-        } else if self.scanning && self.repos.is_empty() {
+        } else if !self.repos.is_empty() {
+            overview::show(ui, self, free);
+        } else if self.scanning {
             self.placeholder(ui, free, "Карта веток", "Ищу репозитории.", None);
-        } else if self.repos.is_empty() {
+        } else {
             let body = "В этой папке нет git-репозиториев. Выбери другую папку.";
             if self.placeholder(ui, free, "Пусто", body, Some("Выбрать папку")) {
                 self.pick_folder();
             }
-        } else {
-            let count = fmt::count(self.repos.len(), "репозиторий", "репозитория", "репозиториев");
-            let body = format!("Найдено: {count}. Выбери проект слева, чтобы открыть его схему.");
-            self.placeholder(ui, free, "Карта веток", &body, None);
         }
     }
 
@@ -768,7 +1102,7 @@ impl App {
                 }
             }
             if response.clicked {
-                self.commands.push(kind);
+                self.commands.push(kind.clone());
             }
         }
     }

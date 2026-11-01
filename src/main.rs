@@ -1,7 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod actions;
 mod anim;
 mod app;
+mod diff;
+mod export;
 mod fmt;
 mod gfx;
 mod git;
@@ -12,6 +15,7 @@ mod install;
 mod installer;
 mod layout;
 mod map;
+mod overview;
 mod panel;
 mod scan;
 mod shell;
@@ -20,6 +24,7 @@ mod text;
 mod theme;
 mod ui;
 mod update;
+mod watch;
 
 use std::path::PathBuf;
 

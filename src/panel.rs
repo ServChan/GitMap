@@ -2,7 +2,8 @@
 //! Страницы сменяются сдвигом: новая въезжает, сразу видно, что произошло.
 
 use crate::anim::{self, ease_out};
-use crate::app::{Selection, Session};
+use crate::app::{Action, Selection, Session};
+use crate::diff::Request;
 use crate::fmt;
 use crate::git::{FileKind, Idx};
 use crate::layout::{Line, LineKind, Options};
@@ -21,6 +22,13 @@ const MERGED_PREVIEW: usize = 12;
 pub struct Change {
     pub relayout: bool,
     pub labels: bool,
+    pub action: Option<Action>,
+}
+
+/// Сведения о проекте из обзора папки.
+pub struct Info {
+    pub web_url: Option<String>,
+    pub family: Vec<(String, std::path::PathBuf)>,
 }
 
 fn line_title(line: &Line) -> String {
@@ -128,8 +136,23 @@ fn commit_row(ui: &mut Ui, s: &mut Session, rect: Rect, commit: Idx, zoom_to: bo
     }
 }
 
+fn action_row(ui: &mut Ui, x: f64, y: f64, width: f64, info: &Info, change: &mut Change) {
+    let mut list = vec![("VS Code", Action::Editor), ("Терминал", Action::Terminal), ("Папка", Action::Folder)];
+    if let Some(url) = &info.web_url {
+        list.push(("Сайт", Action::Web(url.clone())));
+    }
+    let gap = 6.0;
+    let cell = (width - gap * (list.len() as f64 - 1.0)) / list.len() as f64;
+    for (i, (label, action)) in list.into_iter().enumerate() {
+        let rect = Rect::from_origin_size((x + i as f64 * (cell + gap), y), (cell, 32.0));
+        if ui.button(("action", label), rect, label, Tone::Plain) {
+            change.action = Some(action);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn legend(ui: &mut Ui, s: &mut Session, options: &mut Options, show_tags: &mut bool, rect: Rect, free: Rect, change: &mut Change, peek: &mut Option<u32>) {
+fn legend(ui: &mut Ui, s: &mut Session, options: &mut Options, show_tags: &mut bool, rect: Rect, free: Rect, change: &mut Change, peek: &mut Option<u32>, info: &Info) {
     let pal = ui.pal;
     let x = rect.x0 + PAD;
     let width = rect.width() - PAD * 2.0;
@@ -142,6 +165,19 @@ fn legend(ui: &mut Ui, s: &mut Session, options: &mut Options, show_tags: &mut b
         s.run_search();
     }
     let mut y = rect.y0 + 58.0;
+
+    if s.search.trim().is_empty() {
+        action_row(ui, x, y, width, info, change);
+        y += 40.0;
+        if !s.work.is_empty() {
+            let label = fmt::count(s.work.len(), "файл не в коммите", "файла не в коммите", "файлов не в коммите");
+            if ui.button("show-work", Rect::from_origin_size((x, y), (width, 32.0)), &label, Tone::Primary) {
+                s.select(Selection::Work);
+                s.page_changed = ui.now();
+            }
+            y += 40.0;
+        }
+    }
 
     if !s.search.trim().is_empty() {
         let hits = s.search_hits.len();
@@ -181,6 +217,13 @@ fn legend(ui: &mut Ui, s: &mut Session, options: &mut Options, show_tags: &mut b
     if ui.button("latest", Rect::from_origin_size((x + half + 8.0, y), (half, 32.0)), "К концу", Tone::Plain) {
         s.motion.camera.aim(map::latest(&s.map, free));
         s.motion.auto_frame = false;
+    }
+    y += 38.0;
+    if ui.button("export-png", Rect::from_origin_size((x, y), (half, 32.0)), "Сохранить PNG", Tone::Plain) {
+        change.action = Some(Action::ExportPng);
+    }
+    if ui.button("export-svg", Rect::from_origin_size((x + half + 8.0, y), (half, 32.0)), "Сохранить SVG", Tone::Plain) {
+        change.action = Some(Action::ExportSvg);
     }
     y += 40.0;
 
@@ -238,6 +281,17 @@ fn legend(ui: &mut Ui, s: &mut Session, options: &mut Options, show_tags: &mut b
             let note = format!("Ещё {} без имени: их указатели удалены.", fmt::count(unnamed, "ветка", "ветки", "веток"));
             y += 10.0 + ui.paragraph(&note, Face::Body, 12.5, Point::new(x, y + 10.0), width, pal.ink_weak) + 12.0;
         }
+        if !info.family.is_empty() {
+            y = section(ui, x, y + 10.0, width, "Родственные проекты", &fmt::number(info.family.len()));
+            for (name, path) in &info.family {
+                let rect = Rect::from_origin_size((x - 8.0, y), (width + 16.0, 30.0));
+                if ui.button(("family", name), rect, "", Tone::Quiet) {
+                    change.action = Some(Action::Open(path.clone()));
+                }
+                ui.line(name, Face::Body, 14.0, x, y + 15.0, width, pal.ink);
+                y += 32.0;
+            }
+        }
         ui.scroll_content("legend", y + offset - area.y0);
     });
 }
@@ -280,8 +334,8 @@ fn line_view(ui: &mut Ui, s: &mut Session, line_id: u32, rect: Rect) {
     back_button(ui, s, Rect::from_origin_size((x - 8.0, rect.y0 + 10.0), (190.0, 30.0)));
     let line = &s.map.lines[line_id as usize];
     let commits: Vec<Idx> = line.commits.iter().rev().copied().collect();
-    let (first, last) = (commits[commits.len() - 1], commits[0]);
-    let (since, until) = (fmt::day(s.graph.commits[first as usize].time), fmt::day(s.graph.commits[last as usize].time));
+    let first = commits[commits.len() - 1];
+    let (since, until) = (fmt::day(s.graph.commits[first as usize].time), fmt::day(s.graph.commits[commits[0] as usize].time));
     let dates = if since == until { since } else { format!("с {since} по {until}") };
     let authors = s.line_stats.as_ref().filter(|(l, _)| *l == line_id).map(|(_, stats)| {
         let top: Vec<String> = stats.authors.iter().take(3).map(|(a, n)| format!("{a} ({n})")).collect();
@@ -290,10 +344,21 @@ fn line_view(ui: &mut Ui, s: &mut Session, line_id: u32, rect: Rect) {
     let title = line_title(line);
     let mut y = rect.y0 + 48.0;
     y += ui.paragraph(&title, Face::Display, 32.0, Point::new(x, y), width, pal.ink) + 6.0;
+    let last = commits[0];
     y += ui.paragraph(&line_status(s, line_id), Face::Body, 14.5, Point::new(x, y), width, pal.ink) + 12.0;
     y = pair(ui, x, y, width, "Период", &dates);
     if let Some(authors) = authors {
         y = pair(ui, x, y, width, "Авторы", &authors);
+    }
+    if line_id != 0 {
+        let main_name = s.map.lines[0].name.clone();
+        let label = format!("Отличия от {main_name}");
+        if ui.button("line-diff", Rect::from_origin_size((x, y + 4.0), (width, 32.0)), &label, Tone::Plain) {
+            let main_tip = s.map.lines[0].commits[s.map.lines[0].commits.len() - 1];
+            let (main, tip) = (s.graph.commits[main_tip as usize].id, s.graph.commits[last as usize].id);
+            s.open_diff(format!("{title}: отличия от {main_name}"), Request::Branch { main, tip }, None, ui.now());
+        }
+        y += 40.0;
     }
     y = section(ui, x, y + 6.0, width, "Коммиты", &fmt::number(commits.len()));
     let area = Rect::new(rect.x0, y, rect.x1, rect.y1 - 6.0);
@@ -330,7 +395,9 @@ fn commit_view(ui: &mut Ui, s: &mut Session, commit: Idx, rect: Rect) {
     let line_name = line_title(&s.map.lines[s.map.line_of[commit as usize] as usize]);
     let refs: Vec<String> = s.graph.refs.iter().filter(|r| r.commit == commit).map(|r| r.name.clone()).collect();
     let is_head = s.graph.head == Some(commit);
+    let id_of_commit = c.id;
     let mut jump = None;
+    let mut want_diff: Option<Option<String>> = None;
     let area = Rect::new(rect.x0, rect.y0 + 44.0, rect.x1, rect.y1 - 6.0);
     ui.scroll("commit", area, |ui, offset| {
         let mut y = area.y0 + 4.0 - offset;
@@ -341,6 +408,19 @@ fn commit_view(ui: &mut Ui, s: &mut Session, commit: Idx, rect: Rect) {
             copy_text(hash.clone());
         }
         y += 40.0;
+        let half = (width - 8.0) / 2.0;
+        if ui.button("commit-diff", Rect::from_origin_size((x, y), (half, 32.0)), "Изменения", Tone::Primary) {
+            want_diff = Some(None);
+        }
+        let waiting = s.compare_from == Some(commit);
+        let label = if waiting { "Отмена" } else { "Сравнить" };
+        if ui.button("commit-compare", Rect::from_origin_size((x + half + 8.0, y), (half, 32.0)), label, Tone::Plain) {
+            s.compare_from = if waiting { None } else { Some(commit) };
+        }
+        y += 40.0;
+        if waiting {
+            y += ui.paragraph("Щёлкни второй коммит на схеме.", Face::Body, 13.5, Point::new(x, y), width, pal.ink_weak) + 8.0;
+        }
         y = pair(ui, x, y, width, "Автор", &author);
         y = pair(ui, x, y, width, "Дата", &date);
         y = pair(ui, x, y, width, "Ветка", &line_name);
@@ -362,8 +442,18 @@ fn commit_view(ui: &mut Ui, s: &mut Session, commit: Idx, rect: Rect) {
                     y += ui.paragraph("Файлы не менялись.", Face::Body, 14.0, Point::new(x, y + 4.0), width, pal.ink_weak) + 8.0;
                 }
                 for file in details.files.iter().take(400) {
+                    let layout = ui.fonts.layout(&file.path, Face::Body, 12.5, Some((width - 18.0) as f32));
+                    let height = layout.height() as f64;
+                    let row = Rect::new(x - 8.0, y, x + width + 8.0, y + height + 5.0);
+                    let key = id(("file-row", &file.path));
+                    let response = ui.interact(key, row);
+                    let hover = ui.tween((key, "hover"), response.hovered, anim::SNAP);
+                    ui.fill(&RoundedRect::from_rect(row, 6.0), fade(pal.sheet_hover, hover));
+                    if response.clicked {
+                        want_diff = Some(Some(file.path.clone()));
+                    }
                     ui.line(file_badge(file.kind), Face::Mono, 12.5, x, y + 10.0, 14.0, pal.ink_weak);
-                    let height = ui.paragraph(&file.path, Face::Body, 12.5, Point::new(x + 18.0, y + 2.0), width - 18.0, pal.ink);
+                    crate::text::draw(ui.scene, &layout, vello::kurbo::Affine::translate((x + 18.0, y + 2.0)), pal.ink);
                     y += height + 5.0;
                 }
                 if details.files.len() > 400 {
@@ -396,6 +486,10 @@ fn commit_view(ui: &mut Ui, s: &mut Session, commit: Idx, rect: Rect) {
         }
         ui.scroll_content("commit", y + 14.0 + offset - area.y0);
     });
+    if let Some(prefer) = want_diff {
+        let title = subject.clone();
+        s.open_diff(title, Request::Commits { from: None, to: id_of_commit }, prefer, ui.now());
+    }
     if let Some(parent) = jump {
         let zoom = map::current_zoom(s);
         s.motion.camera.aim(map::focus_commit(&s.map, parent, zoom));
@@ -406,7 +500,44 @@ fn commit_view(ui: &mut Ui, s: &mut Session, commit: Idx, rect: Rect) {
     }
 }
 
-pub fn show(ui: &mut Ui, s: &mut Session, options: &mut Options, show_tags: &mut bool, rect: Rect, free: Rect) -> Change {
+/// Незакоммиченная работа: список файлов и переход к строкам.
+fn work_view(ui: &mut Ui, s: &mut Session, rect: Rect) {
+    let pal = ui.pal;
+    let x = rect.x0 + PAD;
+    let width = rect.width() - PAD * 2.0;
+    back_button(ui, s, Rect::from_origin_size((x - 8.0, rect.y0 + 10.0), (190.0, 30.0)));
+    let mut y = rect.y0 + 48.0;
+    y += ui.paragraph("Незакоммиченная работа", Face::Semi, 20.0, Point::new(x, y), width, pal.ink) + 10.0;
+    let open = ui.button("work-diff", Rect::from_origin_size((x, y), (width, 32.0)), "Показать изменения", Tone::Primary);
+    y = section(ui, x, y + 42.0, width, "Файлы", &fmt::number(s.work.len()));
+    let area = Rect::new(rect.x0, y, rect.x1, rect.y1 - 6.0);
+    let files = s.work.clone();
+    let mut prefer = None;
+    ui.scroll("work-files", area, |ui, offset| {
+        ui.scroll_content("work-files", files.len() as f64 * 26.0);
+        let first = (offset / 26.0) as usize;
+        let last = (first + (area.height() / 26.0) as usize + 2).min(files.len());
+        for (i, file) in files.iter().enumerate().take(last).skip(first) {
+            let top = area.y0 + i as f64 * 26.0 - offset;
+            let row = Rect::new(rect.x0 + 10.0, top, rect.x1 - 10.0, top + 26.0);
+            let key = id(("work-file", &file.path));
+            let response = ui.interact(key, row);
+            let hover = ui.tween((key, "hover"), response.hovered, anim::SNAP);
+            ui.fill(&RoundedRect::from_rect(row, 6.0), fade(pal.sheet_hover, hover));
+            ui.line(file_badge(file.kind), Face::Mono, 12.5, x, row.center().y, 14.0, pal.ink_weak);
+            ui.line(&file.path, Face::Body, 12.5, x + 18.0, row.center().y, width - 18.0, pal.ink);
+            if response.clicked {
+                prefer = Some(file.path.clone());
+            }
+        }
+    });
+    if open || prefer.is_some() {
+        s.open_diff("Незакоммиченная работа".to_owned(), Request::Worktree, prefer, ui.now());
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn show(ui: &mut Ui, s: &mut Session, options: &mut Options, show_tags: &mut bool, rect: Rect, free: Rect, info: &Info) -> Change {
     ui.sheet(rect, 16.0, 1.0);
     let mut change = Change::default();
     let mut peek = None;
@@ -421,7 +552,8 @@ pub fn show(ui: &mut Ui, s: &mut Session, options: &mut Options, show_tags: &mut
         ui.alpha(phase, rect);
     }
     match s.selection {
-        Selection::None => legend(ui, s, options, show_tags, content, free, &mut change, &mut peek),
+        Selection::None => legend(ui, s, options, show_tags, content, free, &mut change, &mut peek, info),
+        Selection::Work => work_view(ui, s, content),
         Selection::Line(line) => line_view(ui, s, line, content),
         Selection::Commit(commit) => commit_view(ui, s, commit, content),
     }
