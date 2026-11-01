@@ -91,6 +91,6 @@ if ($LASTEXITCODE -ne 0) {
 }
 $notesPath = Join-Path $dist 'notes.md'
 [IO.File]::WriteAllText($notesPath, $Notes, (New-Object Text.UTF8Encoding $false))
-Invoke-Native { gh release create $tag $setup $latest --repo $Repo --title "Карта веток $version" --notes-file $notesPath }
+Invoke-Native { gh release create $tag $setup $latest --repo $Repo --title "GitMap $version" --notes-file $notesPath }
 if ($LASTEXITCODE -ne 0) { throw 'выпуск не создан' }
 Write-Output "Опубликовано: https://github.com/$Repo/releases/tag/$tag"

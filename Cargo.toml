@@ -1,8 +1,10 @@
 [package]
 name = "gitmap"
-version = "1.0.1"
+version = "1.0.0"
 edition = "2024"
-description = "Карта веток git-репозиториев"
+description = "Git history as a living metro map"
+license = "MIT"
+repository = "https://github.com/ServChan/GitMap"
 default-run = "gitmap"
 
 [dependencies]

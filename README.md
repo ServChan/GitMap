@@ -1,30 +1,43 @@
-# Карта веток
+# GitMap
 
-Программа для Windows: показывает историю git-репозиториев как живую схему метро.
-Выбираешь папку, она находит в ней все репозитории и показывает обзор: что менялось за неделю
-и где что не так. Щелчок по проекту открывает его схему: основная ветка идёт прямой линией
-по центру, остальные расходятся от неё цветными линиями и вливаются обратно.
+[![Platform](https://img.shields.io/badge/Platform-Windows-blue?style=flat-square&logo=windows)](README.md)
+[![Rust](https://img.shields.io/badge/Rust-2024-orange?style=flat-square&logo=rust)](README.md)
+[![Version](https://img.shields.io/badge/Version-1.0.0-purple?style=flat-square)](CHANGELOG.md)
+[![License](https://img.shields.io/badge/License-MIT-yellow?style=flat-square)](LICENSE)
 
-Программа только читает. Она не меняет ни рабочие папки, ни `.git`, поэтому её можно
-наводить на чужие клоны.
+Windows app that draws the history of your git repositories as a living metro map: the main branch runs straight through the centre, other branches split off in colour and merge back.
 
-Всё на Rust: окно на [winit](https://github.com/rust-windowing/winit), графика на
-[Vello](https://github.com/linebender/vello) (2D-рендер на вычислительных шейдерах wgpu),
-текст на [Parley](https://github.com/linebender/parley), история через
-[gitoxide](https://github.com/GitoxideLabs/gitoxide). Git ставить не нужно. Элементы
-интерфейса и анимация написаны здесь же: `src/ui.rs`, `src/anim.rs`.
+**Руководство / User guide:** [Русский](docs/USER_GUIDE_RU.md) · [English](docs/USER_GUIDE_EN.md)
 
-## Установка
+![Metro map of a repository](docs/images/map.png)
 
-`GitMap-Setup.exe` это сама программа: при запуске из «Загрузок» открывается мастер.
-Ставится для одного пользователя в `%LOCALAPPDATA%\Programs\GitMap`, права администратора
-не нужны. Удаляется из «Приложений» Windows или повторным запуском установщика.
+![Folder overview](docs/images/overview.png)
 
-Раз в день программа проверяет новую версию на
-[gitmap-releases](https://github.com/ServChan/gitmap-releases) и показывает кнопку
-обновления. Скачанное проверяется подписью ed25519, проверку можно выключить в окне.
+## Русский
 
-## Запуск из исходников
+### Что это
+
+Карта веток показывает историю git-репозиториев как живую схему метро. Выбираешь папку, программа находит в ней все репозитории и показывает обзор: что менялось за неделю и где что не так. Щелчок по проекту открывает его схему: основная ветка идёт прямой линией по центру, остальные расходятся от неё цветными линиями и вливаются обратно.
+
+Программа только читает. Она не меняет ни рабочие папки, ни `.git`, поэтому её можно наводить на чужие клоны. Git ставить не нужно.
+
+### Возможности
+
+- обзор папки: неотправленные коммиты, незакоммиченная работа, проекты без удалённого репозитория, заброшенные ветки, родственные проекты;
+- живая схема: новые коммиты сами подъезжают на линию, а незакоммиченная работа видна пунктирным отростком от HEAD;
+- изменения по строкам: для коммита, между любыми двумя коммитами и для всей ветки относительно основной;
+- поиск коммита по тексту, автору и началу хеша;
+- открытие проекта в VS Code, терминале, Проводнике или на сайте;
+- экспорт схемы в PNG и SVG;
+- светлая и тёмная тема, работа без анимаций, если они выключены в Windows.
+
+### Установка
+
+Скачай `GitMap-Setup.exe` со страницы [выпусков](https://github.com/ServChan/gitmap-releases/releases/latest) и запусти: откроется мастер. Программа ставится для одного пользователя в `%LOCALAPPDATA%\Programs\GitMap`, права администратора не нужны. Удаляется из «Приложений» Windows или повторным запуском установщика.
+
+Раз в день программа проверяет новую версию и показывает кнопку обновления. Скачанное проверяется подписью ed25519, проверку можно выключить в окне. Настройки лежат в `%APPDATA%\GitMap\settings.json`.
+
+### Сборка
 
 Отладочная сборка открывается сразу, без мастера:
 
@@ -32,126 +45,56 @@
 cargo run -- E:\Coding
 ```
 
-Аргумент необязателен. Если это папка с проектами, она открывается в указателе. Если сам
-репозиторий, указателем становится родительская папка, а проект сразу открывается. Папку
-можно и перетащить в окно. Настройки лежат в `%APPDATA%\GitMap\settings.json`.
-
-Выпускная сборка без установки: `gitmap.exe --portable`.
-
-## Обзор папки
-
-Первый экран показывает всё, с чем стоит что-то сделать:
-
-- **Не отправлено:** коммиты есть только на этом компьютере.
-- **Не закоммичено:** работа лежит в файлах, в истории её ещё нет.
-- **Только на этом диске:** у проекта нет удалённого репозитория.
-- **Заброшенные ветки:** не влиты и не менялись больше трёх месяцев.
-- **За неделю:** где шла работа.
-- **Родственные проекты:** проекты с общим корневым коммитом, например сборки под другую версию.
-
-Голые репозитории считаются резервными копиями: в списке они есть, в обзоре и родстве нет.
-
-## Открытый проект
-
-Схема живая: новые коммиты сами подъезжают на линию, а незакоммиченная работа видна пунктирным
-отростком от HEAD. Программа только смотрит на файлы, кнопки на панели открывают проект в VS Code,
-терминале, Проводнике или на сайте.
-
-Щелчок по файлу коммита показывает изменённые строки. Кнопка «Сравнить» и щелчок по второму коммиту
-сравнивают любые два коммита, а «Отличия от main» показывает только то, что сделано в ветке.
-
-«Сохранить PNG» снимает текущий вид в двойном разрешении, «Сохранить SVG» выгружает всю схему как вектор.
-
-## Как читать схему
-
-| На схеме | Что это |
-|---|---|
-| толстая линия по центру | основная ветка: `origin/HEAD`, иначе `main`, `master`, `trunk`, `develop`, `dev`, иначе то, что открыто сейчас |
-| пунктир по центру | основная ветка закончилась, а другие ещё идут |
-| пунктирный отросток от HEAD | незакоммиченная работа |
-| толстая цветная линия с табличкой | ветка в работе: её указатель не влит в основную |
-| тонкая линия | слитая ветка. Если её указатель удалён, имя берётся из сообщения слияния |
-| штрих | обычный коммит |
-| кольцо | событие: слияние, развилка или указатель |
-| поперечная черта | конец линии |
-| подпись под 45° | тег или указатель, не совпадающий с именем линии |
-| кольцо с сигналом и «вы здесь» | `HEAD`, то, что открыто в рабочей папке |
-| поезд | маршрут живой: поезда ходят по веткам в работе |
-| лента внизу | сколько работы шло в каждый момент истории, по ней можно перемещаться |
-
-Если в настройках Windows выключены анимации, программа работает без них.
-
-## Управление
-
-| Действие | Как |
-|---|---|
-| двигать схему | перетаскивание с разгоном, стрелки, лента внизу |
-| масштаб | колесо, `+`, `-` |
-| вся схема, последние события | `Home`, `End` |
-| выбрать коммит или ветку | щелчок по схеме или по строке справа |
-| снять выбор | `Esc` или щелчок по пустому месту |
-| найти коммит | `Ctrl+F`: текст, автор, начало хеша |
-| перечитать репозиторий | `F5` |
-| перейти между элементами | `Tab`, `Enter` |
-
-## Как устроено
-
-| Файл | Что делает |
-|---|---|
-| `src/scan.rs` | ищет репозитории, пропуская сборки и зависимости |
-| `src/git.rs` | всё чтение из git: история, состояние проекта, сравнение строк |
-| `src/watch.rs` | следит за открытым репозиторием |
-| `src/overview.rs`, `src/diff.rs` | обзор папки, лист сравнения |
-| `src/actions.rs`, `src/export.rs` | внешние инструменты, выгрузка SVG |
-| `src/layout.rs` | раскладка схемы, чистая логика с тестами |
-| `src/map.rs` | камера, ввод, рисование и анимация схемы |
-| `src/ui.rs` | свои элементы интерфейса: кнопки, поля, прокрутка, фокус |
-| `src/anim.rs` | пружины и кривые |
-| `src/text.rs` | текст: раскладка и рисование глифов |
-| `src/gfx.rs` | вывод на GPU и снимок кадра в PNG |
-| `src/shell.rs` | окно без рамки, события, частота кадров |
-| `src/app.rs`, `src/index.rs`, `src/panel.rs` | состояние, указатель проектов, правая панель |
-| `src/install.rs`, `src/installer.rs`, `src/update.rs` | установка, мастер, обновления |
-| `src/headless.rs` | только отладочная сборка: прогон сценария без окна |
-
-Раскладка идёт в четыре шага: коммиты разбираются на линии по цепочкам первых родителей,
-встают в колонки с учётом и родства, и времени, линии получают дорожки без наложений,
-затем колонки раздвигаются так, чтобы переходы оставались под 45°.
-
-История читается максимум на 60 000 коммитов от новых к старым. Если она длиннее,
-в заглавии схемы об этом написано.
-
-Пока ничего не движется, кадры не рисуются. Поезда и сигнал идут 30 раз в секунду
-и только у окна в фокусе.
-
-## Проверка без окна
-
-Отладочная сборка умеет проиграть сценарий и сохранить кадры, ничего не показывая на экране.
-Время идёт шагами 1/60 с, поэтому анимацию можно разглядывать по кадрам:
-
-```bash
-cargo run -- E:\Coding\Minecraft\Iris --script "wait;run 0.4;shot a.png;key Home;run 1.5;shot b.png"
-```
-
-Команды: `size w h`, `wait`, `run секунды`, `sleep мс`, `shot файл`, `move x y`, `click x y`,
-`wheel x y дельта`, `key Имя`, `text строка`, `exec команда`, `export png|svg файл`, `wizard install`, `wizard uninstall`.
+Аргумент необязателен. Если это папка с проектами, она открывается в указателе. Если сам репозиторий, указателем становится родительская папка, а проект сразу открывается. Выпускная сборка без установки: `gitmap.exe --portable`.
 
 ```bash
 cargo test
 ```
 
-## Выпуск
+Устройство кода, проверка без окна и выпуск описаны в [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
-Ключ подписи создаётся один раз: `scripts\release\new-updater-key.ps1`. Закрытый ключ хранится
-в диспетчере учётных данных как `gitmap-release:updater-key`, открытый в `assets\updater.pub`
-и встраивается при сборке. Потеря закрытого ключа оставит установленные копии без обновлений,
-поэтому сохрани его резервную копию.
+## English
 
-Поднять версию в `Cargo.toml`, затем:
+### What It Is
+
+GitMap shows the history of git repositories as a living metro map. Pick a folder and it finds every repository inside, then shows an overview of what changed this week and what needs attention. Click a project to open its map: the main branch runs in a straight line through the centre, the rest split off as coloured lines and merge back.
+
+The app only reads. It never touches working folders or `.git`, so it is safe to point at other people's clones. Git itself does not need to be installed.
+
+The interface is in Russian.
+
+### Features
+
+- folder overview: unpushed commits, uncommitted work, projects with no remote, abandoned branches, related projects;
+- live map: new commits slide onto their line, and uncommitted work shows as a dashed stub from HEAD;
+- line-by-line changes for a commit, between any two commits, and for a whole branch against the main one;
+- commit search by text, author and hash prefix;
+- open a project in VS Code, a terminal, Explorer or on its website;
+- export the map to PNG and SVG;
+- light and dark themes, and no animation when it is turned off in Windows.
+
+### Installation
+
+Download `GitMap-Setup.exe` from the [releases page](https://github.com/ServChan/gitmap-releases/releases/latest) and run it to open the wizard. It installs for one user into `%LOCALAPPDATA%\Programs\GitMap` and needs no administrator rights. Uninstall it from Windows Apps or by running the installer again.
+
+Once a day the app checks for a new version and shows an update button. Downloads are verified with an ed25519 signature, and the check can be turned off in the window. Settings live in `%APPDATA%\GitMap\settings.json`.
+
+### Building
+
+A debug build opens right away, with no wizard:
 
 ```bash
-scripts\release\publish.ps1 -Notes "Что изменилось"
+cargo run -- E:\Coding
 ```
 
-Скрипт собирает `dist\GitMap-Setup.exe` и подписанный `dist\latest.json`. С ключом `-Publish`
-выкладывает выпуск в `ServChan/gitmap-releases`: этот репозиторий должен быть публичным.
+The argument is optional. A folder of projects opens in the project list. A repository opens directly, with its parent folder as the list. For a release build with no installation, use `gitmap.exe --portable`.
+
+```bash
+cargo test
+```
+
+Code structure, headless checks and releasing are covered in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
+
+## Лицензия / License
+
+[MIT](LICENSE)
