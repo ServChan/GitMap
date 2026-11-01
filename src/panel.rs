@@ -1,16 +1,20 @@
-//! Правая панель: условные обозначения схемы, сведения о ветке и о коммите.
+//! Правый лист: условные обозначения схемы, сведения о ветке и о коммите.
+//! Страницы сменяются сдвигом: новая въезжает, сразу видно, что произошло.
 
-use crate::app::{Selection, Session, fit, row};
+use crate::anim::{self, ease_out};
+use crate::app::{Selection, Session};
+use crate::fmt;
 use crate::git::{FileKind, Idx};
 use crate::layout::{Line, LineKind, Options};
 use crate::map;
-use crate::theme::{Palette, semibold};
-use crate::fmt;
-use eframe::egui::{self, Color32, FontId, Rect, RichText, Sense, Stroke, pos2, vec2};
+use crate::text::Face;
+use crate::theme::{fade, mix};
+use crate::ui::{Tone, Ui, copy_text, id};
 use std::collections::HashMap;
+use vello::kurbo::{Circle, Line as Segment, Point, Rect, RoundedRect, Stroke};
 
-pub const WIDTH: f32 = 320.0;
-const MARGIN: f32 = 16.0;
+const PAD: f64 = 18.0;
+const ROW: f64 = 32.0;
 const MERGED_PREVIEW: usize = 12;
 
 #[derive(Default)]
@@ -19,252 +23,238 @@ pub struct Change {
     pub labels: bool,
 }
 
-fn margin() -> egui::Frame {
-    egui::Frame::new().inner_margin(egui::Margin::symmetric(MARGIN as i8, 0))
+fn line_title(line: &Line) -> String {
+    if line.name.is_empty() { "Ветка без имени".to_owned() } else { line.name.clone() }
 }
 
-/// Подзаголовок раздела: тонкая линия сверху, как у граф в таблице.
-fn section(ui: &mut egui::Ui, title: &str, note: &str, pal: &Palette) {
-    ui.add_space(14.0);
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::hover());
-    let painter = ui.painter();
-    painter.hline(rect.x_range(), rect.max.y - 0.5, Stroke::new(1.0, pal.ink));
-    painter.text(rect.left_center(), egui::Align2::LEFT_CENTER, title, FontId::new(13.5, semibold()), pal.ink);
-    painter.text(rect.right_center(), egui::Align2::RIGHT_CENTER, note, FontId::proportional(12.5), pal.ink_weak);
-}
-
-fn line_swatch(painter: &egui::Painter, rect: Rect, line: &Line, pal: &Palette, selected: bool) {
+fn swatch(ui: &mut Ui, c: Point, line: &Line, active: f32) {
+    let pal = ui.pal;
     let color = match line.kind {
-        LineKind::Main => if selected { pal.paper } else { pal.ink },
-        _ if selected => pal.paper,
+        LineKind::Main => pal.ink,
         _ => pal.lines[line.color],
     };
+    let color = mix(color, pal.sheet, active);
     let width = match line.kind {
         LineKind::Main => 6.0,
         LineKind::Active => 4.0,
         LineKind::Merged => 2.0,
     };
-    let (a, b) = (rect.left_center(), rect.right_center());
-    painter.line_segment([a, b], Stroke::new(width, color));
-    let fill = if selected { pal.ink } else { pal.paper };
-    painter.circle(rect.center(), width / 2.0 + 2.0, fill, Stroke::new(1.5, color));
+    ui.scene.stroke(&Stroke::new(width), Default::default(), color, None, &Segment::new((c.x - 14.0, c.y), (c.x + 14.0, c.y)));
+    let fill = mix(pal.sheet, pal.ink, active);
+    let ring = Circle::new(c, width / 2.0 + 2.5);
+    ui.fill(&ring, fill);
+    ui.stroke(&ring, 1.6, color);
 }
 
-fn line_title(line: &Line) -> String {
-    if line.name.is_empty() { "Ветка без имени".to_owned() } else { line.name.clone() }
+/// Заголовок раздела: линейка снизу, число справа.
+fn section(ui: &mut Ui, x: f64, y: f64, width: f64, title: &str, note: &str) -> f64 {
+    let pal = ui.pal;
+    ui.line(title, Face::Semi, 13.5, x, y + 13.0, width - 60.0, pal.ink);
+    ui.line_right(note, Face::Body, 12.5, x + width, y + 13.0, pal.ink_weak);
+    ui.hline(x, x + width, y + 27.0, 1.0, pal.rule);
+    y + 32.0
 }
 
-fn line_row(ui: &mut egui::Ui, s: &mut Session, id: usize, total: Option<usize>, canvas: Rect, pal: &Palette) {
-    let line = &s.map.lines[id];
-    let selected = s.selection == Selection::Line(id as u32);
+fn pair(ui: &mut Ui, x: f64, y: f64, width: f64, key: &str, value: &str) -> f64 {
+    let pal = ui.pal;
+    ui.line(key, Face::Body, 12.5, x, y + 9.0, 72.0, pal.ink_weak);
+    let height = ui.paragraph(value, Face::Body, 14.0, Point::new(x + 76.0, y), width - 76.0, pal.ink);
+    y + height.max(18.0) + 6.0
+}
+
+fn line_row(ui: &mut Ui, s: &mut Session, rect: Rect, line_id: usize, total: Option<usize>, free: Rect, peek: &mut Option<u32>) {
+    let pal = ui.pal;
+    let line = &s.map.lines[line_id];
+    let selected = s.selection == Selection::Line(line_id as u32);
     let title = line_title(line);
     let count = total.unwrap_or(line.commits.len());
-    let response = row(ui, 28.0, selected, &title, pal, |painter, rect, ink, weak| {
-        let swatch = Rect::from_center_size(rect.left_center() + vec2(MARGIN + 14.0, 0.0), vec2(28.0, 12.0));
-        line_swatch(painter, swatch, line, pal, selected);
-        let width = rect.width() - MARGIN * 2.0 - 40.0 - 44.0;
-        let name = fit(painter, title.clone(), FontId::proportional(14.0), ink, width);
-        painter.galley(pos2(swatch.max.x + 10.0, rect.center().y - name.size().y / 2.0), name, ink);
-        painter.text(rect.right_center() - vec2(MARGIN, 0.0), egui::Align2::RIGHT_CENTER, fmt::number(count), FontId::proportional(12.5), weak);
-    });
-    if response.clicked() {
-        let to = map::focus_line(&s.map, &s.map.lines[id], canvas);
-        s.select(Selection::Line(id as u32));
-        s.want_camera = Some(to);
+    let key = id(("line-row", &title, line_id));
+    let response = ui.interact(key, rect);
+    let hover = ui.tween((key, "hover"), response.hovered, anim::SNAP);
+    let lit = ui.tween((key, "lit"), selected, anim::SNAP);
+    if response.hovered {
+        *peek = Some(line_id as u32);
+    }
+    let shape = RoundedRect::from_rect(rect.inset((-6.0, -1.0)), 8.0);
+    ui.fill(&shape, fade(pal.sheet_hover, hover * (1.0 - lit)));
+    ui.fill(&shape, fade(pal.ink, lit));
+    let y = rect.center().y;
+    let line = &s.map.lines[line_id];
+    swatch(ui, Point::new(rect.x0 + PAD + 8.0 + hover as f64 * 2.0, y), line, lit);
+    let ink = mix(pal.ink, pal.sheet, lit);
+    let weak = mix(pal.ink_weak, pal.sheet, lit);
+    let width = rect.width() - PAD * 2.0 - 40.0 - 44.0;
+    ui.line(&title, Face::Body, 14.0, rect.x0 + PAD + 34.0, y, width, ink);
+    ui.line_right(&fmt::number(count), Face::Body, 12.5, rect.x1 - PAD, y, weak);
+    if response.focused {
+        ui.focus_ring(rect.inset((-6.0, 0.0)), 8.0);
+    }
+    if response.clicked {
+        let shot = map::focus_line(&s.map, &s.map.lines[line_id], free);
+        s.select(Selection::Line(line_id as u32));
+        s.motion.camera.aim(shot);
+        s.motion.auto_frame = false;
+        s.page_changed = ui.now();
     }
 }
 
-fn commit_row(ui: &mut egui::Ui, s: &mut Session, commit: Idx, zoom_to: bool, pal: &Palette) {
+fn commit_row(ui: &mut Ui, s: &mut Session, rect: Rect, commit: Idx, zoom_to: bool) {
+    let pal = ui.pal;
     let c = &s.graph.commits[commit as usize];
     let selected = s.selection == Selection::Commit(commit);
     let subject = if c.subject.is_empty() { "Без описания".to_owned() } else { c.subject.clone() };
     let age = fmt::age(c.time);
-    let response = row(ui, 28.0, selected, &subject, pal, |painter, rect, ink, weak| {
-        let width = rect.width() - MARGIN * 2.0 - 58.0;
-        let name = fit(painter, subject.clone(), FontId::proportional(13.5), ink, width);
-        painter.galley(pos2(rect.min.x + MARGIN, rect.center().y - name.size().y / 2.0), name, ink);
-        painter.text(rect.right_center() - vec2(MARGIN, 0.0), egui::Align2::RIGHT_CENTER, &age, FontId::proportional(12.5), weak);
-    });
-    if response.clicked() {
+    let key = id(("commit-row", commit));
+    let response = ui.interact(key, rect);
+    let hover = ui.tween((key, "hover"), response.hovered, anim::SNAP);
+    let shape = RoundedRect::from_rect(rect.inset((-6.0, -1.0)), 8.0);
+    ui.fill(&shape, if selected { pal.ink } else { fade(pal.sheet_hover, hover) });
+    let (ink, weak) = if selected { (pal.sheet, pal.sheet) } else { (pal.ink, pal.ink_weak) };
+    let y = rect.center().y;
+    let age_width = ui.line_right(&age, Face::Body, 12.5, rect.x1 - PAD, y, weak);
+    ui.line(&subject, Face::Body, 13.5, rect.x0 + PAD, y, rect.width() - PAD * 2.0 - age_width - 10.0, ink);
+    if response.focused {
+        ui.focus_ring(rect.inset((-6.0, 0.0)), 8.0);
+    }
+    if response.clicked {
         if zoom_to {
-            s.want_camera = Some(map::focus_commit(&s.map, commit, s.cam.zoom));
+            let zoom = map::current_zoom(s);
+            s.motion.camera.aim(map::focus_commit(&s.map, commit, zoom));
+            s.motion.auto_frame = false;
         }
         s.select(Selection::Commit(commit));
+        s.motion.ring(commit, ui.now());
+        s.page_changed = ui.now();
     }
 }
 
-fn legend(ui: &mut egui::Ui, s: &mut Session, options: &mut Options, show_tags: &mut bool, canvas: Rect, pal: &Palette, change: &mut Change) {
-    let now = ui.input(|i| i.time);
-    margin().show(ui, |ui| {
-        ui.add_space(14.0);
-        let search_id = ui.scope_id().with("search");
-        if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
-            ui.memory_mut(|m| m.request_focus(search_id));
-        }
-        let edit = egui::TextEdit::singleline(&mut s.search)
-            .id(search_id)
-            .hint_text("Найти коммит: текст, автор, хеш")
-            .desired_width(f32::INFINITY);
-        if ui.add(edit).changed() {
-            s.run_search();
-        }
-    });
+#[allow(clippy::too_many_arguments)]
+fn legend(ui: &mut Ui, s: &mut Session, options: &mut Options, show_tags: &mut bool, rect: Rect, free: Rect, change: &mut Change, peek: &mut Option<u32>) {
+    let pal = ui.pal;
+    let x = rect.x0 + PAD;
+    let width = rect.width() - PAD * 2.0;
+    let field = Rect::from_origin_size((x, rect.y0 + 14.0), (width, 36.0));
+    let search_key = id(("input", "commit-search"));
+    if ui.input.key(crate::ui::Key::Find) {
+        ui.state.focus = Some(search_key);
+    }
+    if ui.input_field("commit-search", field, &mut s.search, "Найти коммит: текст, автор, хеш") {
+        s.run_search();
+    }
+    let mut y = rect.y0 + 58.0;
 
     if !s.search.trim().is_empty() {
         let hits = s.search_hits.len();
-        margin().show(ui, |ui| {
-            section(ui, "Найдено", &fmt::number(hits), pal);
-        });
+        y = section(ui, x, y, width, "Найдено", &fmt::number(hits));
         if hits == 0 {
-            margin().show(ui, |ui| {
-                ui.add_space(8.0);
-                ui.label(RichText::new("Таких коммитов нет. Проверь написание или ищи по автору.").color(pal.ink_weak));
-            });
+            ui.paragraph("Таких коммитов нет. Проверь написание или ищи по автору.", Face::Body, 14.0, Point::new(x, y + 6.0), width, pal.ink_weak);
             return;
         }
-        ui.spacing_mut().item_spacing.y = 0.0;
-        egui::ScrollArea::vertical().id_salt("hits").auto_shrink(false).show_rows(ui, 28.0, hits, |ui, range| {
-            for i in range {
-                let commit = s.search_hits[i];
-                commit_row(ui, s, commit, true, pal);
+        let area = Rect::new(rect.x0, y, rect.x1, rect.y1 - 6.0);
+        let list = s.search_hits.clone();
+        ui.scroll("hits", area, |ui, offset| {
+            ui.scroll_content("hits", list.len() as f64 * ROW);
+            let first = (offset / ROW) as usize;
+            let last = (first + (area.height() / ROW) as usize + 2).min(list.len());
+            for (i, commit) in list.iter().enumerate().take(last).skip(first) {
+                let top = area.y0 + i as f64 * ROW - offset;
+                commit_row(ui, s, Rect::new(rect.x0 + 6.0, top, rect.x1 - 6.0, top + ROW), *commit, true);
             }
         });
         return;
     }
 
+    y = section(ui, x, y, width, "Вид", "");
     let mut view_changed = false;
-    margin().show(ui, |ui| {
-        section(ui, "Вид", "", pal);
-        ui.add_space(6.0);
-        view_changed |= ui.checkbox(&mut options.show_merged, "Слитые ветки").changed();
-        view_changed |= ui.checkbox(&mut options.compress, "Сжимать прямые участки").changed();
-        change.labels |= ui.checkbox(show_tags, "Теги").changed();
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            if ui.button("Вся схема").on_hover_text("Home").clicked() {
-                map::move_camera(s, map::whole(&s.map, canvas), now);
-            }
-            if ui.button("К концу").on_hover_text("End").clicked() {
-                map::move_camera(s, map::latest(&s.map, canvas), now);
-            }
-        });
-    });
+    for (label, value) in [("Слитые ветки", &mut options.show_merged), ("Сжимать прямые участки", &mut options.compress)] {
+        view_changed |= ui.toggle(label, Rect::from_origin_size((x, y), (width, 30.0)), label, value);
+        y += 30.0;
+    }
+    change.labels |= ui.toggle("Теги", Rect::from_origin_size((x, y), (width, 30.0)), "Теги", show_tags);
+    y += 36.0;
     change.relayout |= view_changed;
+    let half = (width - 8.0) / 2.0;
+    if ui.button("whole", Rect::from_origin_size((x, y), (half, 32.0)), "Вся схема", Tone::Plain) {
+        s.motion.camera.aim(map::whole(&s.map, free));
+        s.motion.auto_frame = false;
+    }
+    if ui.button("latest", Rect::from_origin_size((x + half + 8.0, y), (half, 32.0)), "К концу", Tone::Plain) {
+        s.motion.camera.aim(map::latest(&s.map, free));
+        s.motion.auto_frame = false;
+    }
+    y += 40.0;
 
-    let mut active: Vec<usize> = (1..s.map.lines.len()).filter(|&i| s.map.lines[i].kind == LineKind::Active).collect();
-    let last_commit = |s: &Session, i: usize| {
-        let line = &s.map.lines[i];
-        s.graph.commits[line.commits[line.commits.len() - 1] as usize].time
-    };
-    active.sort_by_key(|&i| std::cmp::Reverse(last_commit(s, i)));
-    let mut merged: Vec<usize> = (1..s.map.lines.len())
-        .filter(|&i| s.map.lines[i].kind == LineKind::Merged && !s.map.lines[i].name.is_empty() && s.map.lines[i].visible)
-        .collect();
-    merged.sort_by_key(|&i| std::cmp::Reverse(last_commit(s, i)));
+    let lines = &s.map.lines;
+    let last_commit = |i: usize| s.graph.commits[lines[i].commits[lines[i].commits.len() - 1] as usize].time;
+    let mut active: Vec<usize> = (1..lines.len()).filter(|&i| lines[i].kind == LineKind::Active).collect();
+    active.sort_by_key(|&i| std::cmp::Reverse(last_commit(i)));
+    let mut merged: Vec<usize> =
+        (1..lines.len()).filter(|&i| lines[i].kind == LineKind::Merged && !lines[i].name.is_empty() && lines[i].visible).collect();
+    merged.sort_by_key(|&i| std::cmp::Reverse(last_commit(i)));
     // Ветку, которую вливали не раз, показываем одной строкой с общим числом коммитов.
     let mut seen: HashMap<String, usize> = HashMap::new();
     for &i in &merged {
-        *seen.entry(s.map.lines[i].name.clone()).or_default() += s.map.lines[i].commits.len();
+        *seen.entry(lines[i].name.clone()).or_default() += lines[i].commits.len();
     }
     let totals = seen.clone();
-    merged.retain(|&i| seen.remove(&s.map.lines[i].name).is_some());
-    let unnamed = (1..s.map.lines.len()).filter(|&i| s.map.lines[i].kind == LineKind::Merged && s.map.lines[i].name.is_empty()).count();
+    merged.retain(|&i| seen.remove(&lines[i].name).is_some());
+    let unnamed = (1..lines.len()).filter(|&i| lines[i].kind == LineKind::Merged && lines[i].name.is_empty()).count();
 
-    ui.spacing_mut().item_spacing.y = 0.0;
-    egui::ScrollArea::vertical().id_salt("legend").auto_shrink(false).show(ui, |ui| {
-        ui.spacing_mut().item_spacing.y = 0.0;
-        margin().show(ui, |ui| section(ui, "Основная", "коммиты", pal));
-        line_row(ui, s, 0, None, canvas, pal);
+    let area = Rect::new(rect.x0, y, rect.x1, rect.y1 - 6.0);
+    ui.scroll("legend", area, |ui, offset| {
+        let mut y = area.y0 - offset;
+        y = section(ui, x, y + 4.0, width, "Основная", "коммиты");
+        let row = |y: f64| Rect::new(rect.x0 + 6.0, y, rect.x1 - 6.0, y + ROW);
+        line_row(ui, s, row(y), 0, None, free, peek);
+        y += ROW;
         if !active.is_empty() {
-            margin().show(ui, |ui| section(ui, "В работе", &fmt::number(active.len()), pal));
-            for &id in &active {
-                line_row(ui, s, id, None, canvas, pal);
+            y = section(ui, x, y + 10.0, width, "В работе", &fmt::number(active.len()));
+            for &line in &active {
+                if y + ROW > area.y0 && y < area.y1 {
+                    line_row(ui, s, row(y), line, None, free, peek);
+                }
+                y += ROW;
             }
         }
         if !merged.is_empty() {
-            margin().show(ui, |ui| section(ui, "Слитые", &fmt::number(merged.len()), pal));
+            y = section(ui, x, y + 10.0, width, "Слитые", &fmt::number(merged.len()));
             let shown = if s.show_all_merged { merged.len() } else { merged.len().min(MERGED_PREVIEW) };
-            for &id in &merged[..shown] {
-                let total = totals.get(&s.map.lines[id].name).copied();
-                line_row(ui, s, id, total, canvas, pal);
+            for &line in &merged[..shown] {
+                if y + ROW > area.y0 && y < area.y1 {
+                    let total = totals.get(&s.map.lines[line].name).copied();
+                    line_row(ui, s, row(y), line, total, free, peek);
+                }
+                y += ROW;
             }
             if shown < merged.len() {
-                margin().show(ui, |ui| {
-                    ui.add_space(6.0);
-                    if ui.button(format!("Показать все {}", fmt::number(merged.len()))).clicked() {
-                        s.show_all_merged = true;
-                    }
-                });
+                let label = format!("Показать все {}", fmt::number(merged.len()));
+                if ui.button("all-merged", Rect::from_origin_size((x, y + 6.0), (width, 32.0)), &label, Tone::Plain) {
+                    s.show_all_merged = true;
+                }
+                y += 44.0;
             }
         }
         if unnamed > 0 && options.show_merged {
-            margin().show(ui, |ui| {
-                ui.add_space(10.0);
-                let text = format!("Ещё {} без имени: их указатели удалены.", fmt::count(unnamed, "ветка", "ветки", "веток"));
-                ui.label(RichText::new(text).size(12.5).color(pal.ink_weak));
-                ui.add_space(14.0);
-            });
+            let note = format!("Ещё {} без имени: их указатели удалены.", fmt::count(unnamed, "ветка", "ветки", "веток"));
+            y += 10.0 + ui.paragraph(&note, Face::Body, 12.5, Point::new(x, y + 10.0), width, pal.ink_weak) + 12.0;
         }
+        ui.scroll_content("legend", y + offset - area.y0);
     });
 }
 
-fn back_button(ui: &mut egui::Ui, s: &mut Session, pal: &Palette) {
-    let target = s.back.map_or(Selection::None, Selection::Line);
+fn back_button(ui: &mut Ui, s: &mut Session, rect: Rect) {
     let label = if s.back.is_some() { "Назад к ветке" } else { "Назад к обозначениям" };
-    ui.add_space(12.0);
-    let button = egui::Button::new(RichText::new(label).color(pal.ink)).frame(false);
-    if ui.add(button).on_hover_text("Esc").clicked() {
+    if ui.button("back", rect, label, Tone::Quiet) {
+        let target = s.back.map_or(Selection::None, Selection::Line);
         s.select(target);
+        s.page_changed = ui.now();
     }
 }
 
-fn pair(ui: &mut egui::Ui, key: &str, value: &str, pal: &Palette) {
-    ui.horizontal_top(|ui| {
-        let (rect, _) = ui.allocate_exact_size(vec2(72.0, 18.0), Sense::hover());
-        ui.painter().text(rect.left_top() + vec2(0.0, 2.0), egui::Align2::LEFT_TOP, key, FontId::proportional(12.5), pal.ink_weak);
-        ui.add(egui::Label::new(RichText::new(value).color(pal.ink)).wrap());
-    });
-}
-
-fn line_view(ui: &mut egui::Ui, s: &mut Session, id: u32, pal: &Palette) {
-    let line = &s.map.lines[id as usize];
-    let commits: Vec<Idx> = line.commits.iter().rev().copied().collect();
-    let status = line_status(s, id);
-    let (first, last) = (commits[commits.len() - 1], commits[0]);
-    let (since, until) = (fmt::day(s.graph.commits[first as usize].time), fmt::day(s.graph.commits[last as usize].time));
-    let dates = if since == until { since } else { format!("с {since} по {until}") };
-    let authors = s.line_stats.as_ref().filter(|(l, _)| *l == id).map(|(_, stats)| {
-        let top: Vec<String> = stats.authors.iter().take(3).map(|(a, n)| format!("{a} ({n})")).collect();
-        top.join(", ")
-    });
-    let title = line_title(line);
-    margin().show(ui, |ui| {
-        back_button(ui, s, pal);
-        ui.add_space(4.0);
-        ui.add(egui::Label::new(RichText::new(title).heading().color(pal.ink)).wrap());
-        ui.add_space(2.0);
-        ui.add(egui::Label::new(RichText::new(status).color(pal.ink)).wrap());
-        ui.add_space(8.0);
-        pair(ui, "Период", &dates, pal);
-        if let Some(authors) = authors {
-            pair(ui, "Авторы", &authors, pal);
-        }
-        section(ui, "Коммиты", &fmt::number(commits.len()), pal);
-    });
-    ui.spacing_mut().item_spacing.y = 0.0;
-    egui::ScrollArea::vertical().id_salt("line-commits").auto_shrink(false).show_rows(ui, 28.0, commits.len(), |ui, range| {
-        for i in range {
-            commit_row(ui, s, commits[i], false, pal);
-        }
-    });
-}
-
-fn line_status(s: &Session, id: u32) -> String {
-    let line = &s.map.lines[id as usize];
+fn line_status(s: &Session, line_id: u32) -> String {
+    let line = &s.map.lines[line_id as usize];
     let main = &s.map.lines[0].name;
-    let Some((_, stats)) = s.line_stats.as_ref().filter(|(l, _)| *l == id) else {
-        return String::new();
-    };
+    let Some((_, stats)) = s.line_stats.as_ref().filter(|(l, _)| *l == line_id) else { return String::new() };
     match line.kind {
         LineKind::Main => "Основная ветка: идёт по центру схемы.".to_owned(),
         LineKind::Active => {
@@ -283,128 +273,164 @@ fn line_status(s: &Session, id: u32) -> String {
     }
 }
 
-fn file_badge(kind: FileKind) -> (&'static str, &'static str) {
+fn line_view(ui: &mut Ui, s: &mut Session, line_id: u32, rect: Rect) {
+    let pal = ui.pal;
+    let x = rect.x0 + PAD;
+    let width = rect.width() - PAD * 2.0;
+    back_button(ui, s, Rect::from_origin_size((x - 8.0, rect.y0 + 10.0), (190.0, 30.0)));
+    let line = &s.map.lines[line_id as usize];
+    let commits: Vec<Idx> = line.commits.iter().rev().copied().collect();
+    let (first, last) = (commits[commits.len() - 1], commits[0]);
+    let (since, until) = (fmt::day(s.graph.commits[first as usize].time), fmt::day(s.graph.commits[last as usize].time));
+    let dates = if since == until { since } else { format!("с {since} по {until}") };
+    let authors = s.line_stats.as_ref().filter(|(l, _)| *l == line_id).map(|(_, stats)| {
+        let top: Vec<String> = stats.authors.iter().take(3).map(|(a, n)| format!("{a} ({n})")).collect();
+        top.join(", ")
+    });
+    let title = line_title(line);
+    let mut y = rect.y0 + 48.0;
+    y += ui.paragraph(&title, Face::Display, 32.0, Point::new(x, y), width, pal.ink) + 6.0;
+    y += ui.paragraph(&line_status(s, line_id), Face::Body, 14.5, Point::new(x, y), width, pal.ink) + 12.0;
+    y = pair(ui, x, y, width, "Период", &dates);
+    if let Some(authors) = authors {
+        y = pair(ui, x, y, width, "Авторы", &authors);
+    }
+    y = section(ui, x, y + 6.0, width, "Коммиты", &fmt::number(commits.len()));
+    let area = Rect::new(rect.x0, y, rect.x1, rect.y1 - 6.0);
+    ui.scroll("line-commits", area, |ui, offset| {
+        ui.scroll_content("line-commits", commits.len() as f64 * ROW);
+        let first = (offset / ROW) as usize;
+        let last = (first + (area.height() / ROW) as usize + 2).min(commits.len());
+        for (i, commit) in commits.iter().enumerate().take(last).skip(first) {
+            let top = area.y0 + i as f64 * ROW - offset;
+            commit_row(ui, s, Rect::new(rect.x0 + 6.0, top, rect.x1 - 6.0, top + ROW), *commit, false);
+        }
+    });
+}
+
+fn file_badge(kind: FileKind) -> &'static str {
     match kind {
-        FileKind::Added => ("A", "Добавлен"),
-        FileKind::Modified => ("M", "Изменён"),
-        FileKind::Deleted => ("D", "Удалён"),
-        FileKind::Renamed => ("R", "Переименован"),
+        FileKind::Added => "A",
+        FileKind::Modified => "M",
+        FileKind::Deleted => "D",
+        FileKind::Renamed => "R",
     }
 }
 
-fn commit_view(ui: &mut egui::Ui, s: &mut Session, commit: Idx, pal: &Palette) {
-    let ctx = ui.ctx().clone();
+fn commit_view(ui: &mut Ui, s: &mut Session, commit: Idx, rect: Rect) {
+    let pal = ui.pal;
+    let x = rect.x0 + PAD;
+    let width = rect.width() - PAD * 2.0;
+    back_button(ui, s, Rect::from_origin_size((x - 8.0, rect.y0 + 10.0), (190.0, 30.0)));
     let c = &s.graph.commits[commit as usize];
     let hash = c.id.to_string();
     let subject = if c.subject.is_empty() { "Без описания".to_owned() } else { c.subject.clone() };
-    let author = c.author.clone();
-    let date = fmt::date(c.time);
-    let line_id = s.map.line_of[commit as usize];
-    let line_name = line_title(&s.map.lines[line_id as usize]);
+    let (author, date) = (c.author.clone(), fmt::date(c.time));
+    let parents = c.parents.clone();
+    let line_name = line_title(&s.map.lines[s.map.line_of[commit as usize] as usize]);
     let refs: Vec<String> = s.graph.refs.iter().filter(|r| r.commit == commit).map(|r| r.name.clone()).collect();
     let is_head = s.graph.head == Some(commit);
-    let parents: Vec<Idx> = c.parents.clone();
     let mut jump = None;
-
-    egui::ScrollArea::vertical().id_salt("commit").auto_shrink(false).show(ui, |ui| {
-        margin().show(ui, |ui| {
-            back_button(ui, s, pal);
-            ui.add_space(4.0);
-            ui.add(egui::Label::new(RichText::new(&subject).size(20.0).family(semibold()).color(pal.ink)).wrap());
-            ui.add_space(8.0);
-
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(&hash[..hash.len().min(12)]).monospace().color(pal.ink));
-                if ui.small_button("Копировать хеш").clicked() {
-                    ctx.copy_text(hash.clone());
+    let area = Rect::new(rect.x0, rect.y0 + 44.0, rect.x1, rect.y1 - 6.0);
+    ui.scroll("commit", area, |ui, offset| {
+        let mut y = area.y0 + 4.0 - offset;
+        y += ui.paragraph(&subject, Face::Semi, 20.0, Point::new(x, y), width, pal.ink) + 10.0;
+        let shown = &hash[..hash.len().min(12)];
+        ui.line(shown, Face::Mono, 13.5, x, y + 15.0, 120.0, pal.ink);
+        if ui.button("copy-hash", Rect::from_origin_size((x + width - 150.0, y), (150.0, 30.0)), "Копировать хеш", Tone::Plain) {
+            copy_text(hash.clone());
+        }
+        y += 40.0;
+        y = pair(ui, x, y, width, "Автор", &author);
+        y = pair(ui, x, y, width, "Дата", &date);
+        y = pair(ui, x, y, width, "Ветка", &line_name);
+        if !refs.is_empty() {
+            y = pair(ui, x, y, width, "Указатели", &refs.join(", "));
+        }
+        if is_head {
+            y = pair(ui, x, y, width, "HEAD", "Этот коммит открыт в рабочей папке.");
+        }
+        match s.details.as_ref().filter(|(c, _)| *c == commit) {
+            Some((_, Ok(details))) => {
+                let body = details.message.split_once('\n').map_or("", |(_, rest)| rest).trim();
+                if !body.is_empty() {
+                    y = section(ui, x, y + 8.0, width, "Описание", "");
+                    y += ui.paragraph(body, Face::Body, 14.0, Point::new(x, y + 4.0), width, pal.ink) + 8.0;
                 }
-            });
-            ui.add_space(6.0);
-            pair(ui, "Автор", &author, pal);
-            pair(ui, "Дата", &date, pal);
-            pair(ui, "Ветка", &line_name, pal);
-            if !refs.is_empty() {
-                pair(ui, "Указатели", &refs.join(", "), pal);
-            }
-            if is_head {
-                pair(ui, "HEAD", "Этот коммит открыт в рабочей папке.", pal);
-            }
-
-            match s.details.as_ref().filter(|(c, _)| *c == commit) {
-                Some((_, Ok(details))) => {
-                    let body = details.message.split_once('\n').map_or("", |(_, rest)| rest).trim();
-                    if !body.is_empty() {
-                        section(ui, "Описание", "", pal);
-                        ui.add_space(6.0);
-                        ui.add(egui::Label::new(RichText::new(body).color(pal.ink)).wrap());
-                    }
-                    if !details.email.is_empty() {
-                        ui.add_space(4.0);
-                    }
-                    section(ui, "Файлы", &fmt::number(details.files.len()), pal);
-                    ui.add_space(6.0);
-                    if details.files.is_empty() {
-                        ui.label(RichText::new("Файлы не менялись.").color(pal.ink_weak));
-                    }
-                    ui.spacing_mut().item_spacing.y = 3.0;
-                    for file in details.files.iter().take(400) {
-                        let (letter, meaning) = file_badge(file.kind);
-                        ui.horizontal_top(|ui| {
-                            ui.spacing_mut().item_spacing.x = 6.0;
-                            ui.label(RichText::new(letter).monospace().color(pal.ink_weak)).on_hover_text(meaning);
-                            ui.add(egui::Label::new(RichText::new(&file.path).size(12.5).color(pal.ink)).wrap());
-                        });
-                    }
-                    if details.files.len() > 400 {
-                        ui.label(RichText::new(format!("И ещё {}.", fmt::number(details.files.len() - 400))).color(pal.ink_weak));
-                    }
+                y = section(ui, x, y + 8.0, width, "Файлы", &fmt::number(details.files.len()));
+                if details.files.is_empty() {
+                    y += ui.paragraph("Файлы не менялись.", Face::Body, 14.0, Point::new(x, y + 4.0), width, pal.ink_weak) + 8.0;
                 }
-                Some((_, Err(error))) => {
-                    section(ui, "Файлы", "", pal);
-                    ui.add_space(6.0);
-                    ui.label(RichText::new(format!("Не удалось прочитать изменения: {error}")).color(pal.error));
+                for file in details.files.iter().take(400) {
+                    ui.line(file_badge(file.kind), Face::Mono, 12.5, x, y + 10.0, 14.0, pal.ink_weak);
+                    let height = ui.paragraph(&file.path, Face::Body, 12.5, Point::new(x + 18.0, y + 2.0), width - 18.0, pal.ink);
+                    y += height + 5.0;
                 }
-                None => {
-                    section(ui, "Файлы", "", pal);
-                    ui.add_space(6.0);
-                    ui.label(RichText::new("Читаю изменения.").color(pal.ink_weak));
+                if details.files.len() > 400 {
+                    let more = format!("И ещё {}.", fmt::number(details.files.len() - 400));
+                    y += ui.paragraph(&more, Face::Body, 12.5, Point::new(x, y + 2.0), width, pal.ink_weak) + 4.0;
                 }
             }
-            if !parents.is_empty() {
-                let title = if parents.len() > 1 { "Родители, это слияние" } else { "Родитель" };
-                section(ui, title, "", pal);
-                ui.add_space(4.0);
-                for &parent in &parents {
-                    let p = &s.graph.commits[parent as usize];
-                    let text = format!("{}  {}", p.id.to_hex_with_len(8), p.subject);
-                    let galley = fit(ui.painter(), text, FontId::proportional(13.0), Color32::PLACEHOLDER, ui.available_width() - 16.0);
-                    let button = egui::Button::new(galley).frame(false);
-                    if ui.add(button).clicked() {
-                        jump = Some(parent);
-                    }
-                }
-                ui.add_space(14.0);
+            Some((_, Err(error))) => {
+                y = section(ui, x, y + 8.0, width, "Файлы", "");
+                let text = format!("Не удалось прочитать изменения: {error}");
+                y += ui.paragraph(&text, Face::Body, 14.0, Point::new(x, y + 4.0), width, pal.danger) + 8.0;
             }
-        });
+            None => {
+                y = section(ui, x, y + 8.0, width, "Файлы", "");
+                y += ui.paragraph("Читаю изменения.", Face::Body, 14.0, Point::new(x, y + 4.0), width, pal.ink_weak) + 8.0;
+            }
+        }
+        if !parents.is_empty() {
+            let title = if parents.len() > 1 { "Родители, это слияние" } else { "Родитель" };
+            y = section(ui, x, y + 8.0, width, title, "");
+            for &parent in &parents {
+                let p = &s.graph.commits[parent as usize];
+                let text = format!("{}  {}", p.id.to_hex_with_len(8), p.subject);
+                if ui.button(("parent", parent), Rect::from_origin_size((x - 8.0, y), (width + 16.0, 30.0)), "", Tone::Quiet) {
+                    jump = Some(parent);
+                }
+                ui.line(&text, Face::Body, 13.0, x, y + 15.0, width, pal.ink);
+                y += 32.0;
+            }
+        }
+        ui.scroll_content("commit", y + 14.0 + offset - area.y0);
     });
     if let Some(parent) = jump {
-        s.want_camera = Some(map::focus_commit(&s.map, parent, s.cam.zoom));
+        let zoom = map::current_zoom(s);
+        s.motion.camera.aim(map::focus_commit(&s.map, parent, zoom));
+        s.motion.auto_frame = false;
         s.select(Selection::Commit(parent));
+        s.motion.ring(parent, ui.now());
+        s.page_changed = ui.now();
     }
 }
 
-pub fn show(ui: &mut egui::Ui, s: &mut Session, options: &mut Options, show_tags: &mut bool, canvas: Rect, pal: &Palette) -> Change {
-    let full = ui.max_rect();
-    ui.painter().vline(full.min.x + 0.5, full.y_range(), Stroke::new(1.0, pal.ink));
+pub fn show(ui: &mut Ui, s: &mut Session, options: &mut Options, show_tags: &mut bool, rect: Rect, free: Rect) -> Change {
+    ui.sheet(rect, 16.0, 1.0);
     let mut change = Change::default();
-    match s.selection {
-        Selection::None => legend(ui, s, options, show_tags, canvas, pal, &mut change),
-        Selection::Line(id) => line_view(ui, s, id, pal),
-        Selection::Commit(commit) => commit_view(ui, s, commit, pal),
+    let mut peek = None;
+    // Сдвиг страницы при смене: содержимое въезжает справа и проявляется.
+    let phase = ease_out(((ui.now() - s.page_changed) / 0.26) as f32);
+    if phase < 1.0 {
+        ui.animating = true;
     }
-    if let Some(to) = s.want_camera.take() {
-        let now = ui.input(|i| i.time);
-        map::move_camera(s, to, now);
+    let content = rect + vello::kurbo::Vec2::new((1.0 - phase) as f64 * 22.0, 0.0);
+    ui.clip(rect, 16.0);
+    if phase < 1.0 {
+        ui.alpha(phase, rect);
+    }
+    match s.selection {
+        Selection::None => legend(ui, s, options, show_tags, content, free, &mut change, &mut peek),
+        Selection::Line(line) => line_view(ui, s, line, content),
+        Selection::Commit(commit) => commit_view(ui, s, commit, content),
+    }
+    if phase < 1.0 {
+        ui.end_alpha();
+    }
+    ui.unclip();
+    if ui.input.pointer.is_some_and(|p| rect.contains(p)) {
+        s.motion.peek = peek;
     }
     change
 }

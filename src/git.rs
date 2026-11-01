@@ -70,7 +70,6 @@ pub struct FileChange {
 
 pub struct Details {
     pub message: String,
-    pub email: String,
     pub files: Vec<FileChange>,
 }
 
@@ -217,7 +216,7 @@ pub fn details(path: &Path, id: ObjectId) -> Result<Details, String> {
     let commit = repo.find_commit(id).map_err(|e| e.to_string())?;
     let decoded = commit.decode().map_err(|e| e.to_string())?;
     let message = decoded.message.to_str_lossy().trim_end().to_owned();
-    let email = decoded.author().map(|a| a.email.to_str_lossy().into_owned()).unwrap_or_default();
+
     let tree = commit.tree().map_err(|e| e.to_string())?;
     let parent_tree = match commit.parent_ids().next() {
         Some(parent) => {
@@ -242,5 +241,5 @@ pub fn details(path: &Path, id: ObjectId) -> Result<Details, String> {
         })
         .collect();
     files.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(Details { message, email, files })
+    Ok(Details { message, files })
 }

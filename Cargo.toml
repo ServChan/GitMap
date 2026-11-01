@@ -1,16 +1,30 @@
 [package]
 name = "gitmap"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 description = "Карта веток git-репозиториев"
+default-run = "gitmap"
 
 [dependencies]
+arboard = { version = "3.7.0", default-features = false }
+base64 = "0.23.1"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
-eframe = { version = "0.37.0", default-features = false, features = ["accesskit", "default_fonts", "glow", "persistence"] }
+ed25519-dalek = "3.0.0"
+getrandom = "0.4.3"
 gix = { version = "0.90.0", default-features = false, features = ["revision", "blob-diff", "parallel", "sha1"] }
+parley = "0.12.0"
+png = "0.18.1"
+pollster = "0.4"
 rfd = { version = "0.17.2", default-features = false }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.229", features = ["derive"] }
-windows-sys = { version = "0.61.2", features = ["Win32_UI_WindowsAndMessaging"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+vello = "0.11.0"
+webpki-roots = "1.0.10"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Security", "Win32_System_Com", "Win32_System_Diagnostics_ToolHelp", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+winit = "0.30"
+winreg = "0.56.0"
 
 [build-dependencies]
 embed-manifest = "1.5.1"

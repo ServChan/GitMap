@@ -1,46 +1,83 @@
-#![windows_subsystem = "windows"]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod anim;
 mod app;
 mod fmt;
+mod gfx;
 mod git;
+#[cfg(debug_assertions)]
+mod headless;
+mod index;
+mod install;
+mod installer;
 mod layout;
 mod map;
 mod panel;
 mod scan;
-#[cfg(debug_assertions)]
-mod shot;
+mod shell;
+mod sys;
+mod text;
 mod theme;
+mod ui;
+mod update;
 
-use eframe::egui;
 use std::path::PathBuf;
 
-fn main() -> eframe::Result {
+fn main() {
     let mut args = app::StartArgs { path: None, theme: None };
+    let (mut uninstall, mut update, mut portable) = (false, false, false);
+    let mut script: Option<String> = None;
     let mut rest = std::env::args().skip(1);
     while let Some(arg) = rest.next() {
-        if arg == "--theme" {
-            args.theme = match rest.next().as_deref() {
-                Some("light") => Some("light"),
-                Some("dark") => Some("dark"),
-                _ => None,
-            };
-        } else {
-            args.path = Some(PathBuf::from(arg));
+        match arg.as_str() {
+            "--uninstall" => uninstall = true,
+            "--update" => update = true,
+            "--portable" => portable = true,
+            "--theme" => {
+                args.theme = match rest.next().as_deref() {
+                    Some("dark") => Some("dark"),
+                    Some("light") => Some("light"),
+                    _ => None,
+                }
+            }
+            "--script" => script = rest.next(),
+            _ => args.path = Some(PathBuf::from(arg)),
         }
     }
-    let viewport = egui::ViewportBuilder::default()
-        .with_title("Карта веток")
-        .with_app_id("gitmap")
-        .with_inner_size([1480.0, 920.0])
-        .with_min_inner_size([960.0, 600.0])
-        .with_icon(egui::IconData {
-            rgba: include_bytes!("../assets/icon-64.rgba").to_vec(),
-            width: 64,
-            height: 64,
-        });
-    // Отладочная сборка в проверках не должна отнимать фокус у того, что открыто на экране.
     #[cfg(debug_assertions)]
-    let viewport = viewport.with_active(std::env::var_os("GITMAP_BACKGROUND").is_none());
-    let options = eframe::NativeOptions { viewport, ..Default::default() };
-    eframe::run_native("gitmap", options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, args)))))
+    if let Some(script) = &script {
+        if let Err(error) = headless::run(script, args) {
+            eprintln!("{error}");
+        }
+        return;
+    }
+    let _ = script;
+    // Тихое обновление из скачанного установщика: без окна мастера.
+    if update {
+        if let Err(error) = install::silent_update() {
+            sys::message_box(&format!("Обновление не удалось.\n\n{error}"));
+        }
+        return;
+    }
+    // Запуск не из папки установки открывает мастер. Отладочной сборке он не мешает.
+    let wizard = if uninstall {
+        Some(installer::Mode::Uninstall)
+    } else if cfg!(debug_assertions) {
+        std::env::var_os("GITMAP_DEBUG_INSTALLER").map(|_| installer::Mode::Install)
+    } else if !install::running_installed() && !portable {
+        Some(installer::Mode::Install)
+    } else {
+        None
+    };
+    let lock = match wizard {
+        Some(_) => match sys::setup_lock() {
+            Some(lock) => Some(lock),
+            None => {
+                sys::message_box("Установщик уже открыт. Заверши работу с ним.");
+                return;
+            }
+        },
+        None => None,
+    };
+    shell::run(wizard, args, lock);
 }

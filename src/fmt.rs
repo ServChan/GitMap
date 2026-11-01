@@ -78,3 +78,8 @@ pub fn month(time: i64) -> String {
 pub fn day_of_month(time: i64) -> String {
     local(time).map_or_else(String::new, |d| d.day().to_string())
 }
+
+/// «марта 2026»: для подписи «с …». Именительный падеж здесь был бы ошибкой.
+pub fn month_year_from(time: i64) -> String {
+    local(time).map_or_else(String::new, |d| format!("{} {}", MONTHS[d.month0() as usize], d.year()))
+}

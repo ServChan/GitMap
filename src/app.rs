@@ -1,24 +1,28 @@
-//! Состояние окна, фоновые задачи и левая панель с указателем проектов.
+//! Состояние окна и фоновые задачи. Кадр собирается здесь: схема во всё окно,
+//! поверх неё листы указателя и сведений.
 
+use crate::anim::{self, ease_out};
 use crate::git::{self, Details, Graph, Idx, RefKind, Summary, branch_name};
 use crate::layout::{self, LineKind, Map, Options};
-use crate::map::{self, Cam, Tween};
-use crate::theme::{self, Palette, semibold};
-use crate::{fmt, panel, scan};
-use eframe::egui::{
-    self, Color32, CornerRadius, FontId, Galley, Painter, Rect, Response, Sense, Stroke, StrokeKind,
-    pos2, text::{LayoutJob, TextWrapping}, vec2,
-};
+use crate::map::{self, Motion};
+use crate::text::Face;
+use crate::theme::{DARK, LIGHT, Palette, fade};
+use crate::ui::{Key, Tone, Ui, id};
+use crate::{fmt, index, install, panel, scan, update};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
+use vello::kurbo::{Line, Point, Rect, Stroke};
 
-const INDEX_WIDTH: f32 = 288.0;
+pub const INDEX_WIDTH: f64 = 304.0;
+pub const PANEL_WIDTH: f64 = 336.0;
+pub const MARGIN: f64 = 12.0;
 const SUMMARY_THREADS: usize = 3;
-const STATE_KEY: &str = "gitmap";
+
+pub type Waker = Arc<dyn Fn() + Send + Sync>;
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Sort {
@@ -33,42 +37,24 @@ pub enum ThemeChoice {
     Dark,
 }
 
-impl ThemeChoice {
-    fn next(self) -> Self {
-        match self {
-            Self::System => Self::Light,
-            Self::Light => Self::Dark,
-            Self::Dark => Self::System,
-        }
-    }
-    fn label(self) -> &'static str {
-        match self {
-            Self::System => "Тема: как в системе",
-            Self::Light => "Тема: бумага",
-            Self::Dark => "Тема: ночная",
-        }
-    }
-    fn preference(self) -> egui::ThemePreference {
-        match self {
-            Self::System => egui::ThemePreference::System,
-            Self::Light => egui::ThemePreference::Light,
-            Self::Dark => egui::ThemePreference::Dark,
-        }
-    }
-}
-
 #[derive(Serialize, Deserialize)]
-struct Saved {
-    root: Option<PathBuf>,
-    sort: Sort,
-    theme: ThemeChoice,
-    collapsed: HashSet<String>,
-    show_merged: bool,
-    compress: bool,
-    show_tags: bool,
+#[serde(default)]
+pub struct Settings {
+    pub root: Option<PathBuf>,
+    pub sort: Sort,
+    pub theme: ThemeChoice,
+    pub collapsed: HashSet<String>,
+    pub show_merged: bool,
+    pub compress: bool,
+    pub show_tags: bool,
+    pub auto_update: bool,
+    pub last_update_check: u64,
+    /// Найденная новая версия: показывается и без сети, и до следующей проверки.
+    pub update_available: Option<update::Manifest>,
+    pub window: Option<(u32, u32)>,
 }
 
-impl Default for Saved {
+impl Default for Settings {
     fn default() -> Self {
         Self {
             root: None,
@@ -78,8 +64,48 @@ impl Default for Saved {
             show_merged: true,
             compress: true,
             show_tags: true,
+            auto_update: true,
+            last_update_check: 0,
+            update_available: None,
+            window: None,
         }
     }
+}
+
+impl Settings {
+    fn path() -> Option<PathBuf> {
+        install::settings_dir().map(|dir| dir.join("settings.json"))
+    }
+
+    pub fn load() -> Self {
+        Self::path()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self) {
+        let Some(path) = Self::path() else { return };
+        let Ok(text) = serde_json::to_string_pretty(self) else { return };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        // Через временный файл: прерванная запись не должна съесть настройки.
+        let temp = path.with_extension("tmp");
+        if std::fs::write(&temp, text).is_ok() {
+            let _ = std::fs::rename(temp, path);
+        }
+    }
+}
+
+/// Что сейчас с обновлением программы.
+pub enum UpdateState {
+    Idle,
+    Checking,
+    UpToDate,
+    Available(update::Manifest),
+    Downloading,
+    Failed(String),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -89,22 +115,20 @@ pub enum Selection {
     Line(u32),
 }
 
-struct Repo {
-    path: PathBuf,
-    name: String,
-    group: String,
-    summary: Option<Result<Summary, String>>,
+pub struct Repo {
+    pub path: PathBuf,
+    pub name: String,
+    pub group: String,
+    pub summary: Option<Result<Summary, String>>,
+    pub found_at: f64,
 }
 
 /// Открытый репозиторий со всем, что нужно схеме и правой панели.
 pub struct Session {
     pub graph: Arc<Graph>,
     pub map: Map,
-    pub cam: Cam,
-    pub tween: Option<Tween>,
-    pub needs_framing: bool,
-    pub auto_frame: bool,
-    pub framed_size: egui::Vec2,
+    pub motion: Motion,
+    pub activity: Vec<u32>,
     pub selection: Selection,
     /// Откуда пришли к коммиту: кнопка «Назад» вернёт к этой ветке.
     pub back: Option<u32>,
@@ -117,9 +141,10 @@ pub struct Session {
     pub search_hits: Vec<Idx>,
     pub details: Option<(Idx, Result<Details, String>)>,
     pub want_details: Option<Idx>,
-    pub want_camera: Option<Cam>,
     pub line_stats: Option<(u32, LineStats)>,
     pub show_all_merged: bool,
+    /// Когда сменилась страница правой панели.
+    pub page_changed: f64,
 }
 
 pub struct LineStats {
@@ -132,35 +157,30 @@ pub struct LineStats {
 impl Session {
     fn new(graph: Arc<Graph>, map: Map, path: &Path, show_tags: bool) -> Self {
         let title = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
-        let branches: HashSet<&str> = graph
-            .refs
-            .iter()
-            .filter(|r| r.kind != RefKind::Tag)
-            .map(|r| branch_name(r.kind, &r.name))
-            .collect();
+        let branches: HashSet<&str> =
+            graph.refs.iter().filter(|r| r.kind != RefKind::Tag).map(|r| branch_name(r.kind, &r.name)).collect();
         let active = map.lines.iter().filter(|l| l.kind == LineKind::Active).count();
         let oldest = graph.commits.iter().map(|c| c.time).min().unwrap_or_default();
         let mut caption = format!(
-            "{}. {}, {}",
+            "{}  ·  {}  ·  {}",
             map.lines[0].name,
             fmt::count(graph.commits.len(), "коммит", "коммита", "коммитов"),
             fmt::count(branches.len(), "ветка", "ветки", "веток"),
         );
         if active > 0 {
-            caption.push_str(&format!(", {active} в работе"));
+            caption.push_str(&format!("  ·  {active} в работе"));
         }
-        caption.push_str(&format!(". Начало: {}", fmt::month_year(oldest)));
+        caption.push_str(&format!("  ·  с {}", fmt::month_year_from(oldest)));
         if graph.truncated {
-            caption.push_str(". Показана новая часть истории");
+            caption.push_str("  ·  показана новая часть истории");
         }
+        let motion = Motion::new(&map);
+        let activity = map::activity(&map);
         let mut session = Self {
             graph,
             map,
-            cam: Cam { x: 0.0, y: 0.0, zoom: 1.0 },
-            tween: None,
-            needs_framing: true,
-            auto_frame: true,
-            framed_size: egui::Vec2::ZERO,
+            motion,
+            activity,
             selection: Selection::None,
             back: None,
             title,
@@ -171,16 +191,16 @@ impl Session {
             search_hits: Vec::new(),
             details: None,
             want_details: None,
-            want_camera: None,
             line_stats: None,
             show_all_merged: false,
+            page_changed: 0.0,
         };
         session.rebuild_labels(show_tags);
         session
     }
 
     /// Указатели, которые не совпадают с именем своей линии, подписываются у станции.
-    fn rebuild_labels(&mut self, show_tags: bool) {
+    pub fn rebuild_labels(&mut self, show_tags: bool) {
         let mut grouped: HashMap<Idx, Vec<&str>> = HashMap::new();
         for r in &self.graph.refs {
             if r.kind == RefKind::Tag && !show_tags {
@@ -259,38 +279,51 @@ enum Msg {
     Found { generation: u64, path: PathBuf },
     ScanDone { generation: u64 },
     Summary { path: PathBuf, result: Result<Summary, String> },
-    Loaded { generation: u64, path: PathBuf, keep_camera: bool, result: Result<Option<(Arc<Graph>, Map)>, String> },
+    Loaded { generation: u64, path: PathBuf, keep_view: bool, result: Result<Option<(Arc<Graph>, Map)>, String> },
     Relaid { generation: u64, options: Options, map: Option<Map> },
     Details { commit: Idx, result: Result<Details, String> },
     Picked(PathBuf),
+    UpdateChecked { manual: bool, result: Result<Option<update::Manifest>, String> },
+    UpdateDownloaded(Result<PathBuf, String>),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum WindowCommand {
+    Close,
+    Minimize,
+    ToggleMaximize,
+    Drag,
 }
 
 pub struct App {
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
     summaries: Sender<PathBuf>,
-    root: Option<PathBuf>,
-    repos: Vec<Repo>,
-    scanning: bool,
+    waker: Waker,
+    pub settings: Settings,
+    pub repos: Vec<Repo>,
+    pub scanning: bool,
     scan_generation: u64,
     scan_cancel: Arc<AtomicBool>,
-    filter: String,
-    sort: Sort,
-    theme: ThemeChoice,
-    collapsed: HashSet<String>,
-    session: Option<Session>,
+    pub filter: String,
+    pub session: Option<Session>,
     empty_repo: Option<PathBuf>,
-    open_path: Option<PathBuf>,
+    pub open_path: Option<PathBuf>,
     loading: bool,
     load_generation: u64,
     load_error: Option<String>,
-    options: Options,
-    show_tags: bool,
     /// Репозиторий, который надо открыть, как только сканирование его найдёт.
     open_when_found: Option<PathBuf>,
     /// Прокрутить список к проекту, открытому не щелчком по нему.
-    reveal_open: bool,
-    canvas: Rect,
+    pub reveal_open: bool,
+    /// Обновлять из программы можно только установленную копию.
+    pub can_update: bool,
+    pub update: UpdateState,
+    pub commands: Vec<WindowCommand>,
+    forced_theme: Option<ThemeChoice>,
+    pub system_dark: bool,
+    started: f64,
+    pending_start: Option<PathBuf>,
 }
 
 pub struct StartArgs {
@@ -299,87 +332,102 @@ pub struct StartArgs {
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>, args: StartArgs) -> Self {
-        theme::install(&cc.egui_ctx);
-        let saved: Saved = cc.storage.and_then(|s| eframe::get_value(s, STATE_KEY)).unwrap_or_default();
-        let theme = match args.theme {
-            Some("light") => ThemeChoice::Light,
-            Some("dark") => ThemeChoice::Dark,
-            _ => saved.theme,
-        };
-        cc.egui_ctx.set_theme(theme.preference());
-
+    pub fn new(args: StartArgs, waker: Waker) -> Self {
+        let settings = Settings::load();
         let (tx, rx) = channel();
         let (summaries, queue) = channel::<PathBuf>();
         let queue = Arc::new(Mutex::new(queue));
         for _ in 0..SUMMARY_THREADS {
-            let (queue, tx, ctx) = (queue.clone(), tx.clone(), cc.egui_ctx.clone());
+            let (queue, tx, waker) = (queue.clone(), tx.clone(), waker.clone());
             std::thread::spawn(move || {
                 loop {
                     let next = queue.lock().ok().and_then(|q| q.recv().ok());
                     let Some(path) = next else { return };
                     let result = git::summary(&path);
                     let _ = tx.send(Msg::Summary { path, result });
-                    ctx.request_repaint();
+                    waker();
                 }
             });
         }
-
+        let update = match &settings.update_available {
+            Some(manifest) if update::newer(&manifest.version, install::VERSION) => UpdateState::Available(manifest.clone()),
+            _ => UpdateState::Idle,
+        };
+        let forced_theme = match args.theme {
+            Some("light") => Some(ThemeChoice::Light),
+            Some("dark") => Some(ThemeChoice::Dark),
+            _ => None,
+        };
         let mut app = Self {
             tx,
             rx,
             summaries,
-            root: None,
+            waker,
+            settings,
             repos: Vec::new(),
             scanning: false,
             scan_generation: 0,
             scan_cancel: Arc::new(AtomicBool::new(false)),
             filter: String::new(),
-            sort: saved.sort,
-            theme,
-            collapsed: saved.collapsed,
             session: None,
             empty_repo: None,
             open_path: None,
             loading: false,
             load_generation: 0,
             load_error: None,
-            options: Options { show_merged: saved.show_merged, compress: saved.compress },
-            show_tags: saved.show_tags,
             open_when_found: None,
             reveal_open: false,
-            canvas: Rect::ZERO,
+            can_update: update::configured() && install::running_installed(),
+            update,
+            commands: Vec::new(),
+            forced_theme,
+            system_dark: false,
+            started: 0.0,
+            pending_start: None,
         };
+        if app.can_update {
+            std::thread::spawn(install::clean_downloaded_updates);
+            let due = update::now_secs().saturating_sub(app.settings.last_update_check) >= update::CHECK_EVERY_SECS;
+            if app.settings.auto_update && due {
+                app.check_update(false);
+            }
+        }
         // Путь из командной строки: папка проектов или сам проект.
         match args.path {
             Some(path) if scan::is_repo(&path) => {
                 let root = path.parent().map_or_else(|| path.clone(), Path::to_path_buf);
                 app.open_when_found = Some(path);
-                app.start_scan(root, &cc.egui_ctx);
+                app.pending_start = Some(root);
             }
-            Some(path) => app.start_scan(path, &cc.egui_ctx),
-            None => {
-                if let Some(root) = saved.root.filter(|r| r.is_dir()) {
-                    app.start_scan(root, &cc.egui_ctx);
-                }
-            }
+            Some(path) => app.pending_start = Some(path),
+            None => app.pending_start = app.settings.root.clone().filter(|r| r.is_dir()),
         }
         app
     }
 
-    fn start_scan(&mut self, root: PathBuf, ctx: &egui::Context) {
+    pub fn palette(&self) -> &'static Palette {
+        let dark = match self.forced_theme.unwrap_or(self.settings.theme) {
+            ThemeChoice::System => self.system_dark,
+            ThemeChoice::Light => false,
+            ThemeChoice::Dark => true,
+        };
+        if dark { &DARK } else { &LIGHT }
+    }
+
+    pub fn start_scan(&mut self, root: PathBuf, now: f64) {
         self.scan_cancel.store(true, Ordering::Relaxed);
         self.scan_cancel = Arc::new(AtomicBool::new(false));
         self.scan_generation += 1;
-        self.root = Some(root.clone());
+        self.settings.root = Some(root.clone());
         self.repos.clear();
         self.session = None;
         self.empty_repo = None;
         self.open_path = None;
         self.load_error = None;
         self.scanning = true;
+        self.started = now;
         let generation = self.scan_generation;
-        let (cancel, tx, ctx) = (self.scan_cancel.clone(), self.tx.clone(), ctx.clone());
+        let (cancel, tx, waker) = (self.scan_cancel.clone(), self.tx.clone(), self.waker.clone());
         std::thread::spawn(move || {
             scan::run(&root, &cancel, &|found| {
                 let message = match found {
@@ -387,46 +435,50 @@ impl App {
                     scan::Found::Done => Msg::ScanDone { generation },
                 };
                 let _ = tx.send(message);
-                ctx.request_repaint();
+                waker();
             });
         });
     }
 
-    fn open_repo(&mut self, path: PathBuf, keep_camera: bool, ctx: &egui::Context) {
+    pub fn open_repo(&mut self, path: PathBuf, keep_view: bool) {
         self.load_generation += 1;
         self.loading = true;
         self.load_error = None;
         self.open_path = Some(path.clone());
         self.empty_repo = None;
         let generation = self.load_generation;
-        let options = self.options;
-        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        let options = self.layout_options();
+        let (tx, waker) = (self.tx.clone(), self.waker.clone());
         std::thread::spawn(move || {
             let result = git::load(&path).map(|graph| {
                 let map = layout::build(&graph, options);
                 map.map(|map| (Arc::new(graph), map))
             });
-            let _ = tx.send(Msg::Loaded { generation, path, keep_camera, result });
-            ctx.request_repaint();
+            let _ = tx.send(Msg::Loaded { generation, path, keep_view, result });
+            waker();
         });
     }
 
-    fn relayout(&mut self, ctx: &egui::Context) {
+    fn layout_options(&self) -> Options {
+        Options { show_merged: self.settings.show_merged, compress: self.settings.compress }
+    }
+
+    pub fn relayout(&mut self) {
         let Some(session) = &self.session else { return };
         self.load_generation += 1;
         let generation = self.load_generation;
-        let (graph, options) = (session.graph.clone(), self.options);
-        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        let (graph, options) = (session.graph.clone(), self.layout_options());
+        let (tx, waker) = (self.tx.clone(), self.waker.clone());
         std::thread::spawn(move || {
             let map = layout::build(&graph, options);
             let _ = tx.send(Msg::Relaid { generation, options, map });
-            ctx.request_repaint();
+            waker();
         });
     }
 
-    fn pick_folder(&self, ctx: &egui::Context) {
-        let (tx, ctx) = (self.tx.clone(), ctx.clone());
-        let start = self.root.clone();
+    pub fn pick_folder(&self) {
+        let (tx, waker) = (self.tx.clone(), self.waker.clone());
+        let start = self.settings.root.clone();
         std::thread::spawn(move || {
             let mut dialog = rfd::FileDialog::new().set_title("Папка с проектами");
             if let Some(start) = start {
@@ -434,16 +486,36 @@ impl App {
             }
             if let Some(path) = dialog.pick_folder() {
                 let _ = tx.send(Msg::Picked(path));
-                ctx.request_repaint();
+                waker();
             }
         });
     }
 
-    fn drain(&mut self, ctx: &egui::Context) {
+    pub fn check_update(&mut self, manual: bool) {
+        if manual {
+            self.update = UpdateState::Checking;
+        }
+        let (tx, waker) = (self.tx.clone(), self.waker.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(Msg::UpdateChecked { manual, result: update::check() });
+            waker();
+        });
+    }
+
+    pub fn download_update(&mut self) {
+        self.update = UpdateState::Downloading;
+        let (tx, waker) = (self.tx.clone(), self.waker.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(Msg::UpdateDownloaded(update::download()));
+            waker();
+        });
+    }
+
+    fn drain(&mut self, now: f64) {
         while let Ok(message) = self.rx.try_recv() {
             match message {
                 Msg::Found { generation, path } if generation == self.scan_generation => {
-                    let root = self.root.clone().unwrap_or_default();
+                    let root = self.settings.root.clone().unwrap_or_default();
                     let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
                     let group = path
                         .parent()
@@ -454,9 +526,9 @@ impl App {
                     if self.open_when_found.as_ref() == Some(&path) {
                         self.open_when_found = None;
                         self.reveal_open = true;
-                        self.open_repo(path.clone(), false, ctx);
+                        self.open_repo(path.clone(), false);
                     }
-                    self.repos.push(Repo { path, name, group, summary: None });
+                    self.repos.push(Repo { path, name, group, summary: None, found_at: now });
                 }
                 Msg::ScanDone { generation } if generation == self.scan_generation => self.scanning = false,
                 Msg::Summary { path, result } => {
@@ -464,16 +536,15 @@ impl App {
                         repo.summary = Some(result);
                     }
                 }
-                Msg::Loaded { generation, path, keep_camera, result } if generation == self.load_generation => {
+                Msg::Loaded { generation, path, keep_view, result } if generation == self.load_generation => {
                     self.loading = false;
                     match result {
                         Ok(Some((graph, map))) => {
-                            let camera = self.session.as_ref().filter(|_| keep_camera).map(|s| s.cam);
-                            let mut session = Session::new(graph, map, &path, self.show_tags);
-                            if let Some(camera) = camera {
-                                session.cam = camera;
-                                session.needs_framing = false;
-                                session.auto_frame = false;
+                            let previous = self.session.take().filter(|_| keep_view);
+                            let mut session = Session::new(graph, map, &path, self.settings.show_tags);
+                            if let Some(previous) = previous {
+                                session.motion = previous.motion;
+                                session.motion.replay(&session.map);
                             }
                             self.session = Some(session);
                         }
@@ -488,14 +559,16 @@ impl App {
                     }
                 }
                 Msg::Relaid { generation, options, map } if generation == self.load_generation => {
-                    if let (Some(session), Some(map), true) = (&mut self.session, map, options == self.options) {
+                    let same = options == self.layout_options();
+                    if let (Some(session), Some(map), true) = (&mut self.session, map, same) {
                         session.map = map;
-                        session.needs_framing = true;
+                        session.activity = map::activity(&session.map);
+                        session.motion.replay(&session.map);
                         if matches!(session.selection, Selection::Line(_)) {
                             session.selection = Selection::None;
                         }
                         session.line_stats = None;
-                        session.rebuild_labels(self.show_tags);
+                        session.rebuild_labels(self.settings.show_tags);
                     }
                 }
                 Msg::Details { commit, result } => {
@@ -505,368 +578,199 @@ impl App {
                         session.details = Some((commit, result));
                     }
                 }
-                Msg::Picked(path) => self.start_scan(path, ctx),
+                Msg::Picked(path) => self.start_scan(path, now),
+                Msg::UpdateChecked { manual, result } => {
+                    self.settings.last_update_check = update::now_secs();
+                    match result {
+                        Ok(Some(manifest)) => {
+                            self.settings.update_available = Some(manifest.clone());
+                            self.update = UpdateState::Available(manifest);
+                        }
+                        Ok(None) if manual => self.update = UpdateState::UpToDate,
+                        Err(error) if manual => self.update = UpdateState::Failed(error),
+                        // Сбой фоновой проверки не повод отвлекать: проверим завтра.
+                        _ => {}
+                    }
+                }
+                // Новая версия закроет эту копию сама, но настройки лучше сохранить заранее.
+                Msg::UpdateDownloaded(result) => match result.and_then(|path| update::run(&path)) {
+                    Ok(()) => {
+                        self.settings.update_available = None;
+                        self.settings.save();
+                        self.commands.push(WindowCommand::Close);
+                    }
+                    Err(error) => self.update = UpdateState::Failed(error),
+                },
                 _ => {}
             }
         }
     }
 
-    fn fetch_details(&mut self, ctx: &egui::Context) {
+    fn fetch_details(&mut self) {
         let Some(session) = &mut self.session else { return };
         let Some(commit) = session.want_details.take() else { return };
         let (path, id) = (session.graph.path.clone(), session.graph.commits[commit as usize].id);
-        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        let (tx, waker) = (self.tx.clone(), self.waker.clone());
         std::thread::spawn(move || {
             let result = git::details(&path, id);
             let _ = tx.send(Msg::Details { commit, result });
-            ctx.request_repaint();
+            waker();
         });
     }
 
-    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        if ctx.input(|i| i.key_pressed(egui::Key::F5))
+    pub fn dropped(&mut self, path: PathBuf, now: f64) {
+        if path.is_dir() {
+            self.start_scan(path, now);
+        }
+    }
+
+    /// Один кадр всего окна.
+    pub fn frame(&mut self, ui: &mut Ui) {
+        let now = ui.now();
+        if let Some(root) = self.pending_start.take() {
+            self.start_scan(root, now);
+        }
+        self.drain(now);
+        let (w, h) = ui.size;
+        if ui.input.key(Key::F5)
             && let Some(path) = self.open_path.clone()
         {
-            self.open_repo(path, true, ctx);
+            self.open_repo(path, true);
         }
+
+        let opened = self.session.is_some();
+        let slide = ui.tween("panel-open", opened, anim::SOFT) as f64;
+        let index_rect = Rect::new(MARGIN, MARGIN, MARGIN + INDEX_WIDTH, h - MARGIN);
+        let panel_x = w - MARGIN - PANEL_WIDTH + (1.0 - slide) * (PANEL_WIDTH + MARGIN * 2.0);
+        let panel_rect = Rect::new(panel_x, 44.0, panel_x + PANEL_WIDTH, h - MARGIN);
+        let free = Rect::new(index_rect.x1, 0.0, panel_x.min(w), h);
+        ui.covers.push(index_rect);
+        if opened {
+            ui.covers.push(panel_rect);
+        }
+        self.canvas(ui, free);
+        self.caption_buttons(ui, free);
+        index::show(ui, self, index_rect);
+        let mut options = self.layout_options();
         if let Some(session) = &mut self.session {
-            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                if let Some(line) = session.back {
-                    session.select(Selection::Line(line));
-                } else {
-                    session.select(Selection::None);
-                }
-            }
-            map::handle_keys(ctx, session, self.canvas);
-        }
-        let dropped = ctx.input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf()));
-        if let Some(path) = dropped.filter(|p| p.is_dir()) {
-            self.start_scan(path, ctx);
-        }
-    }
-
-    fn index_panel(&mut self, ui: &mut egui::Ui, pal: &Palette) {
-        let ctx = ui.ctx().clone();
-        let full = ui.max_rect();
-        ui.painter().vline(full.max.x - 0.5, full.y_range(), Stroke::new(1.0, pal.ink));
-
-        egui::Frame::new().inner_margin(egui::Margin { left: 16, right: 16, top: 16, bottom: 8 }).show(ui, |ui| {
-            ui.set_width(INDEX_WIDTH - 33.0);
-            match &self.root {
-                Some(root) => {
-                    let name = root.file_name().map_or_else(|| root.display().to_string(), |n| n.to_string_lossy().into_owned());
-                    let font = FontId::new(28.0, theme::display());
-                    let galley = fit(ui.painter(), name, font, pal.ink, INDEX_WIDTH - 33.0);
-                    let (rect, _) = ui.allocate_exact_size(galley.size(), Sense::hover());
-                    ui.painter().galley(rect.min, galley, pal.ink);
-                    let path = root.display().to_string();
-                    let galley = fit(ui.painter(), path.clone(), FontId::proportional(12.5), pal.ink_weak, INDEX_WIDTH - 33.0);
-                    let (rect, response) = ui.allocate_exact_size(galley.size(), Sense::hover());
-                    ui.painter().galley(rect.min, galley, pal.ink_weak);
-                    response.on_hover_text(path);
-                }
-                None => {
-                    ui.label(egui::RichText::new("Проекты").heading());
-                }
-            }
-            ui.add_space(4.0);
-            if ui.button(if self.root.is_some() { "Сменить папку" } else { "Выбрать папку" }).clicked() {
-                self.pick_folder(&ctx);
-            }
-            ui.add_space(2.0);
-            ui.add(
-                egui::TextEdit::singleline(&mut self.filter)
-                    .hint_text("Найти проект")
-                    .desired_width(f32::INFINITY),
-            );
-        });
-
-        // Шапка таблицы: щелчок меняет порядок строк.
-        let header = ui.allocate_exact_size(vec2(INDEX_WIDTH - 1.0, 24.0), Sense::hover()).0;
-        ui.painter().hline(header.x_range(), header.max.y - 0.5, Stroke::new(1.0, pal.ink));
-        let small = FontId::proportional(12.5);
-        for (rect, label, sort, align) in [
-            (Rect::from_min_size(header.min + vec2(16.0, 0.0), vec2(120.0, 24.0)), "Проект", Sort::Name, egui::Align2::LEFT_CENTER),
-            (Rect::from_min_size(pos2(header.max.x - 96.0, header.min.y), vec2(80.0, 24.0)), "Изменён", Sort::Recent, egui::Align2::RIGHT_CENTER),
-        ] {
-            let response = ui.interact(rect, ui.scope_id().with(label), Sense::click());
-            response.widget_info(|| {
-                egui::WidgetInfo::selected(egui::Role::Button, true, self.sort == sort, format!("Сортировать: {label}"))
-            });
-            let color = if self.sort == sort || response.hovered() { pal.ink } else { pal.ink_weak };
-            let font = if self.sort == sort { FontId::new(12.5, semibold()) } else { small.clone() };
-            let anchor = if align == egui::Align2::LEFT_CENTER { rect.left_center() } else { rect.right_center() };
-            ui.painter().text(anchor, align, label, font, color);
-            if response.has_focus() {
-                ui.painter().rect_stroke(rect, CornerRadius::ZERO, Stroke::new(2.0, pal.ink), StrokeKind::Inside);
-            }
-            if response.clicked() {
-                self.sort = sort;
-            }
-        }
-
-        ui.painter().text(pos2(header.max.x - 78.0, header.center().y), egui::Align2::RIGHT_CENTER, "Веток", small.clone(), pal.ink_weak);
-
-        let footer_height = 62.0;
-        let list_height = (full.max.y - ui.cursor().min.y - footer_height).max(40.0);
-        let needle = self.filter.trim().to_lowercase();
-        let groups = self.grouped(&needle);
-        let mut open = None;
-        let mut toggle = None;
-        let mut reveal_done = false;
-        egui::ScrollArea::vertical().max_height(list_height).min_scrolled_height(list_height).auto_shrink(false).show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 0.0;
-            for (group, members) in &groups {
-                let collapsed = needle.is_empty() && self.collapsed.contains(group);
-                if !group.is_empty() {
-                    let title = group.clone();
-                    let count = fmt::number(members.len());
-                    let label = format!("Папка {title}, проектов: {count}");
-                    let response = row(ui, 32.0, false, &label, pal, |painter, rect, ink, weak| {
-                        let chevron = rect.left_center() + vec2(20.0, 1.0);
-                        let shape = if collapsed {
-                            vec![chevron + vec2(-3.0, -5.0), chevron + vec2(3.0, 0.0), chevron + vec2(-3.0, 5.0)]
-                        } else {
-                            vec![chevron + vec2(-5.0, -3.0), chevron + vec2(5.0, -3.0), chevron + vec2(0.0, 3.0)]
-                        };
-                        painter.add(egui::Shape::convex_polygon(shape, ink, Stroke::NONE));
-                        let name = fit(painter, title.clone(), FontId::new(13.5, semibold()), ink, rect.width() - 84.0);
-                        painter.galley(rect.left_center() + vec2(32.0, -name.size().y / 2.0), name, ink);
-                        painter.text(rect.right_center() - vec2(16.0, 0.0), egui::Align2::RIGHT_CENTER, count.as_str(), FontId::proportional(12.5), weak);
-                    });
-                    if response.clicked() {
-                        toggle = Some(group.clone());
-                    }
-                }
-                if collapsed {
-                    continue;
-                }
-                for &at in members {
-                    let repo = &self.repos[at];
-                    let selected = self.open_path.as_ref() == Some(&repo.path);
-                    let (age, branches) = match &repo.summary {
-                        Some(Ok(summary)) => (summary.last_commit.map(fmt::age).unwrap_or_default(), summary.branches),
-                        _ => (String::new(), 0),
-                    };
-                    let response = row(ui, 28.0, selected, &repo.name, pal, |painter, rect, ink, weak| {
-                        let age_width = 58.0;
-                        let name = fit(painter, repo.name.clone(), FontId::proportional(14.0), ink, rect.width() - 32.0 - age_width - 28.0);
-                        painter.galley(rect.left_center() + vec2(16.0, -name.size().y / 2.0), name, ink);
-                        painter.text(rect.right_center() - vec2(16.0, 0.0), egui::Align2::RIGHT_CENTER, &age, FontId::proportional(12.5), weak);
-                        if branches > 1 {
-                            let x = rect.max.x - 16.0 - age_width - 4.0;
-                            painter.text(pos2(x, rect.center().y), egui::Align2::RIGHT_CENTER, branches.to_string(), FontId::new(12.5, semibold()), weak);
-                        }
-                    });
-                    if response.clicked() {
-                        open = Some(repo.path.clone());
-                    }
-                    if selected && self.reveal_open {
-                        response.scroll_to_me(Some(egui::Align::Center));
-                        reveal_done = true;
-                    }
-                }
-            }
-            if self.repos.is_empty() && !self.scanning && self.root.is_some() {
-                ui.add_space(16.0);
-                ui.horizontal(|ui| {
-                    ui.add_space(16.0);
-                    ui.label(egui::RichText::new("В этой папке нет git-репозиториев.").color(pal.ink_weak));
-                });
-            }
-        });
-        if reveal_done {
-            self.reveal_open = false;
-        }
-        if let Some(path) = open {
-            self.open_repo(path, false, &ctx);
-        }
-        if let Some(group) = toggle
-            && !self.collapsed.remove(&group)
-        {
-            self.collapsed.insert(group);
-        }
-
-        // Подвал: итог списка и тема.
-        let foot = Rect::from_min_max(pos2(full.min.x, full.max.y - footer_height), pos2(full.max.x - 1.0, full.max.y));
-        ui.painter().rect_filled(foot, CornerRadius::ZERO, pal.paper);
-        ui.painter().hline(foot.x_range(), foot.min.y, Stroke::new(1.0, pal.ink));
-        let status = if self.scanning {
-            format!("Ищу репозитории. Найдено: {}", self.repos.len())
-        } else {
-            fmt::count(self.repos.len(), "репозиторий", "репозитория", "репозиториев")
-        };
-        ui.painter().text(foot.min + vec2(16.0, 10.0), egui::Align2::LEFT_TOP, status, small, pal.ink_weak);
-        let button = Rect::from_min_size(foot.min + vec2(16.0, 28.0), vec2(180.0, 26.0));
-        let toggle_theme = ui.interact(button, ui.scope_id().with("theme"), Sense::click());
-        let label = self.theme.label();
-        toggle_theme.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
-        ui.painter().text(button.left_center(), egui::Align2::LEFT_CENTER, label, FontId::proportional(13.5), pal.ink);
-        if toggle_theme.hovered() {
-            ui.painter().hline(button.min.x..=button.min.x + 130.0, button.center().y + 9.0, Stroke::new(1.0, pal.ink));
-        }
-        if toggle_theme.has_focus() {
-            ui.painter().rect_stroke(button, CornerRadius::ZERO, Stroke::new(2.0, pal.ink), StrokeKind::Outside);
-        }
-        if toggle_theme.clicked() {
-            self.theme = self.theme.next();
-            ctx.set_theme(self.theme.preference());
-        }
-    }
-
-    /// Группы с индексами строк. Корень первым, служебные папки на `_` в конце.
-    fn grouped(&self, needle: &str) -> Vec<(String, Vec<usize>)> {
-        let mut groups: HashMap<&str, Vec<usize>> = HashMap::new();
-        for (i, repo) in self.repos.iter().enumerate() {
-            if needle.is_empty() || repo.name.to_lowercase().contains(needle) {
-                groups.entry(&repo.group).or_default().push(i);
-            }
-        }
-        let time = |i: usize| match &self.repos[i].summary {
-            Some(Ok(summary)) => summary.last_commit.unwrap_or_default(),
-            _ => 0,
-        };
-        let mut list: Vec<(String, Vec<usize>)> = groups
-            .into_iter()
-            .map(|(group, mut members)| {
-                match self.sort {
-                    Sort::Name => members.sort_by_key(|&i| self.repos[i].name.to_lowercase()),
-                    Sort::Recent => members.sort_by_key(|&i| (std::cmp::Reverse(time(i)), self.repos[i].name.to_lowercase())),
-                }
-                (group.to_owned(), members)
-            })
-            .collect();
-        list.sort_by_key(|(group, _)| (group.starts_with('_'), !group.is_empty(), group.to_lowercase()));
-        list
-    }
-
-    fn central(&mut self, ui: &mut egui::Ui, pal: &Palette) {
-        let area = ui.available_rect_before_wrap();
-        self.canvas = map::canvas_rect(area);
-        let title_of = |path: &Option<PathBuf>| {
-            path.as_ref().and_then(|p| p.file_name()).map_or_else(String::new, |n| n.to_string_lossy().into_owned())
-        };
-        if let Some(error) = &self.load_error {
-            let title = title_of(&self.open_path);
-            let body = format!("Не удалось прочитать репозиторий: {error}");
-            map::placeholder(ui, pal, &title, &body, None);
-        } else if let Some(session) = &mut self.session {
-            map::show(ui, session, pal);
-        } else if self.loading {
-            map::placeholder(ui, pal, &title_of(&self.open_path), "Читаю историю.", None);
-        } else if self.empty_repo.is_some() {
-            let title = title_of(&self.open_path);
-            map::placeholder(ui, pal, &title, "В этом репозитории пока нет коммитов. После первого коммита здесь появится схема.", None);
-        } else if self.root.is_none() {
-            let body = "Выбери папку с проектами. Программа найдёт в ней все git-репозитории и нарисует ветки каждого как схему метро. Папку можно просто перетащить в окно.";
-            if map::placeholder(ui, pal, "Карта веток", body, Some("Выбрать папку")) {
-                self.pick_folder(ui.ctx());
-            }
-        } else if self.scanning && self.repos.is_empty() {
-            map::placeholder(ui, pal, "Карта веток", "Ищу репозитории.", None);
-        } else if self.repos.is_empty() {
-            let body = "В этой папке нет git-репозиториев. Выбери другую папку.";
-            if map::placeholder(ui, pal, "Пусто", body, Some("Выбрать папку")) {
-                self.pick_folder(ui.ctx());
-            }
-        } else {
-            let body = format!(
-                "{}. Выбери проект слева, чтобы открыть его схему.",
-                fmt::count(self.repos.len(), "репозиторий найден", "репозитория найдено", "репозиториев найдено")
-            );
-            map::placeholder(ui, pal, "Карта веток", &body, None);
-        }
-    }
-}
-
-impl eframe::App for App {
-    #[cfg(debug_assertions)]
-    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
-        crate::shot::inject(raw_input);
-    }
-
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
-        #[cfg(debug_assertions)]
-        crate::shot::tick(&ctx);
-        self.drain(&ctx);
-        self.handle_shortcuts(&ctx);
-        let pal = theme::palette(ui);
-        let frame = egui::Frame::new().fill(pal.paper);
-
-        egui::Panel::left("index")
-            .exact_size(INDEX_WIDTH)
-            .resizable(false)
-            .show_separator_line(false)
-            .frame(frame)
-            .show(ui, |ui| self.index_panel(ui, pal));
-
-        if let Some(session) = &mut self.session {
-            let mut change = panel::Change::default();
-            egui::Panel::right("details")
-                .exact_size(panel::WIDTH)
-                .resizable(false)
-                .show_separator_line(false)
-                .frame(frame)
-                .show(ui, |ui| {
-                    change = panel::show(ui, session, &mut self.options, &mut self.show_tags, self.canvas, pal);
-                });
+            let change = panel::show(ui, session, &mut options, &mut self.settings.show_tags, panel_rect, free);
+            self.settings.show_merged = options.show_merged;
+            self.settings.compress = options.compress;
             if change.relayout {
-                self.relayout(&ctx);
+                self.relayout();
             }
             if change.labels
                 && let Some(session) = &mut self.session
             {
-                session.rebuild_labels(self.show_tags);
+                session.rebuild_labels(self.settings.show_tags);
             }
         }
-        egui::CentralPanel::no_frame().frame(frame).show(ui, |ui| self.central(ui, pal));
-        self.fetch_details(&ctx);
+        self.fetch_details();
+        ui.finish();
     }
 
-    fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        let saved = Saved {
-            root: self.root.clone(),
-            sort: self.sort,
-            theme: self.theme,
-            collapsed: self.collapsed.clone(),
-            show_merged: self.options.show_merged,
-            compress: self.options.compress,
-            show_tags: self.show_tags,
+    fn canvas(&mut self, ui: &mut Ui, free: Rect) {
+        let title_of = |path: &Option<PathBuf>| {
+            path.as_ref().and_then(|p| p.file_name()).map_or_else(String::new, |n| n.to_string_lossy().into_owned())
         };
-        eframe::set_value(storage, STATE_KEY, &saved);
+        let open_title = title_of(&self.open_path);
+        if let Some(error) = self.load_error.clone() {
+            self.placeholder(ui, free, &open_title, &format!("Не удалось прочитать репозиторий: {error}"), None);
+        } else if self.session.is_some() {
+            if let Some(session) = &mut self.session {
+                map::handle_keys(ui, session, free);
+                if ui.input.key(Key::Escape) {
+                    let target = session.back.map_or(Selection::None, Selection::Line);
+                    session.select(target);
+                }
+                map::show(ui, session, free, 1.0);
+            }
+        } else if self.loading {
+            self.placeholder(ui, free, &open_title, "Читаю историю.", None);
+        } else if self.empty_repo.is_some() {
+            let body = "В этом репозитории пока нет коммитов. После первого коммита здесь появится схема.";
+            self.placeholder(ui, free, &open_title, body, None);
+        } else if self.settings.root.is_none() {
+            let body = "Выбери папку с проектами. Программа найдёт в ней все git-репозитории и нарисует ветки каждого как схему метро. Папку можно просто перетащить в окно.";
+            if self.placeholder(ui, free, "Карта веток", body, Some("Выбрать папку")) {
+                self.pick_folder();
+            }
+        } else if self.scanning && self.repos.is_empty() {
+            self.placeholder(ui, free, "Карта веток", "Ищу репозитории.", None);
+        } else if self.repos.is_empty() {
+            let body = "В этой папке нет git-репозиториев. Выбери другую папку.";
+            if self.placeholder(ui, free, "Пусто", body, Some("Выбрать папку")) {
+                self.pick_folder();
+            }
+        } else {
+            let count = fmt::count(self.repos.len(), "репозиторий", "репозитория", "репозиториев");
+            let body = format!("Найдено: {count}. Выбери проект слева, чтобы открыть его схему.");
+            self.placeholder(ui, free, "Карта веток", &body, None);
+        }
     }
-}
 
-/// Текст в одну строку: не поместился, обрезается многоточием.
-pub fn fit(painter: &Painter, text: String, font: FontId, color: Color32, width: f32) -> Arc<Galley> {
-    let mut job = LayoutJob::simple_singleline(text, font, color);
-    job.wrap = TextWrapping::truncate_at_width(width.max(1.0));
-    painter.layout_job(job)
-}
+    fn placeholder(&self, ui: &mut Ui, free: Rect, title: &str, body: &str, action: Option<&str>) -> bool {
+        let pal = ui.pal;
+        let time = ui.now() - self.started;
+        if time < 3.0 {
+            ui.animating = true;
+        }
+        map::demo(ui, free, time);
+        let x = free.x0 + 48.0;
+        let y = (free.center().y - 300.0).max(56.0);
+        let t = time as f32;
+        let appear = ease_out(t / 0.5);
+        let title_height = ui.paragraph(title, Face::Display, 72.0, Point::new(x, y + (1.0 - appear) as f64 * 16.0), free.width() - 96.0, fade(pal.ink, appear));
+        let sub = ease_out((t - 0.12) / 0.5);
+        let body_y = y + title_height + 6.0 + (1.0 - sub) as f64 * 10.0;
+        let body_height = ui.paragraph(body, Face::Body, 16.5, Point::new(x, body_y), 560.0, fade(pal.ink_weak, sub));
+        let mut clicked = false;
+        if let Some(label) = action {
+            let rect = Rect::from_origin_size((x, body_y + body_height + 18.0), (220.0, 42.0));
+            clicked = ui.button("placeholder-action", rect, label, Tone::Primary);
+        }
+        clicked
+    }
 
-/// Строка списка: наведение, фокус, выбор. Выбранная строка инвертируется.
-pub fn row(
-    ui: &mut egui::Ui,
-    height: f32,
-    selected: bool,
-    label: &str,
-    pal: &Palette,
-    paint: impl FnOnce(&Painter, Rect, Color32, Color32),
-) -> Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::click());
-    response.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, selected, label));
-    let painter = ui.painter_at(rect);
-    if selected {
-        painter.rect_filled(rect, CornerRadius::ZERO, pal.ink);
-    } else if response.hovered() {
-        painter.rect_filled(rect, CornerRadius::ZERO, pal.paper_hover);
+    /// Окно без рамки Windows: кнопки и область перетаскивания свои.
+    fn caption_buttons(&mut self, ui: &mut Ui, free: Rect) {
+        let pal = ui.pal;
+        let (w, _) = ui.size;
+        let band = Rect::new(free.x0, 0.0, w - 138.0, 36.0);
+        if ui.pointer_in(band) && !ui.any_active() {
+            if ui.input.double_click {
+                self.commands.push(WindowCommand::ToggleMaximize);
+            } else if ui.input.pressed {
+                self.commands.push(WindowCommand::Drag);
+            }
+        }
+        for (i, kind) in [WindowCommand::Minimize, WindowCommand::ToggleMaximize, WindowCommand::Close].into_iter().enumerate() {
+            let rect = Rect::from_origin_size((w - 138.0 + i as f64 * 46.0, 0.0), (46.0, 36.0));
+            let key = id(("caption", i));
+            let response = ui.interact(key, rect);
+            let hover = ui.tween((key, "hover"), response.hovered, anim::SNAP);
+            let close = kind == WindowCommand::Close;
+            let fill = if close { pal.danger } else { pal.sheet_hover };
+            ui.fill(&rect, fade(fill, hover));
+            let color = crate::theme::mix(pal.ink, if close { pal.on_danger } else { pal.ink }, hover);
+            let c = rect.center();
+            let thin = Stroke::new(1.3);
+            match kind {
+                WindowCommand::Minimize => {
+                    ui.scene.stroke(&thin, Default::default(), color, None, &Line::new((c.x - 5.0, c.y), (c.x + 5.0, c.y)));
+                }
+                WindowCommand::ToggleMaximize => {
+                    ui.scene.stroke(&thin, Default::default(), color, None, &Rect::new(c.x - 5.0, c.y - 5.0, c.x + 5.0, c.y + 5.0));
+                }
+                _ => {
+                    ui.scene.stroke(&thin, Default::default(), color, None, &Line::new((c.x - 5.0, c.y - 5.0), (c.x + 5.0, c.y + 5.0)));
+                    ui.scene.stroke(&thin, Default::default(), color, None, &Line::new((c.x + 5.0, c.y - 5.0), (c.x - 5.0, c.y + 5.0)));
+                }
+            }
+            if response.clicked {
+                self.commands.push(kind);
+            }
+        }
     }
-    let (ink, weak) = if selected { (pal.paper, pal.paper) } else { (pal.ink, pal.ink_weak) };
-    paint(&painter, rect, ink, weak);
-    if response.has_focus() {
-        let color = if selected { pal.paper } else { pal.ink };
-        painter.rect_stroke(rect.shrink(1.0), CornerRadius::ZERO, Stroke::new(2.0, color), StrokeKind::Inside);
-    }
-    response
+
 }
